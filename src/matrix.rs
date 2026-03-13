@@ -18,27 +18,21 @@
 //! Padding blocks (for N that isn't a multiple of 4) stay zero and are
 //! never written to during factorisation.
 
-use crate::vector::VecF32;
+use crate::vector::VecF64;
 
-pub const fn num_tiles(n: usize) -> usize {
-    (n + 3) / 4
-}
-
-pub const fn num_blocks(n: usize) -> usize {
-    let t = num_tiles(n);
-    t * t
-}
+const B: usize = 4;
+const BS: usize = B * B;
 
 #[repr(align(64))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Block {
-    pub data: [f32; 16],
+    pub data: [f64; 16],
 }
 
 impl Block {
-    pub const ZERO: Self = Self { data: [0f32; 16] };
+    pub const ZERO: Self = Self { data: [0f64; 16] };
     pub const IDENTITY: Self = {
-        let mut d = [0f32; 16];
+        let mut d = [0f64; 16];
         d[0] = 1.0;
         d[5] = 1.0;
         d[10] = 1.0;
@@ -47,22 +41,26 @@ impl Block {
     };
 
     #[inline(always)]
-    pub fn get(&self, row: usize, col: usize) -> f32 {
+    pub fn get(&self, row: usize, col: usize) -> f64 {
+        // 4 comes from 4x4 block
         unsafe { *self.data.get_unchecked(row * 4 + col) }
     }
 
     #[inline(always)]
-    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f32 {
+    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f64 {
+        // 4 comes from 4x4 block
         unsafe { self.data.get_unchecked_mut(row * 4 + col) }
     }
 
     #[inline(always)]
-    pub fn set(&mut self, row: usize, col: usize, val: f32) {
+    pub fn set(&mut self, row: usize, col: usize, val: f64) {
+        // 4 comes from 4x4 block
         unsafe { *self.data.get_unchecked_mut(row * 4 + col) = val }
     }
 
     #[inline(always)]
     pub fn mulsub_assign(&mut self, a: &Self, b: &Self) {
+        // 4 comes from 4x4 block
         for k in 0..4 {
             let b_row = [b.get(k, 0), b.get(k, 1), b.get(k, 2), b.get(k, 3)];
             for i in 0..4 {
@@ -116,7 +114,7 @@ pub struct Matrix<const N: usize, const GRID: usize> {
 }
 
 impl<const N: usize, const GRID: usize> Matrix<N, GRID> {
-    pub const TILES: usize = num_tiles(N);
+    pub const TILES: usize = crate::num_tiles(N);
 
     pub const ZERO: Self = Self { blocks: [Block::ZERO; GRID] };
 
@@ -139,7 +137,7 @@ impl<const N: usize, const GRID: usize> Matrix<N, GRID> {
         m
     }
 
-    pub fn from_flat(data: &[f32]) -> Self {
+    pub fn from_flat(data: &[f64]) -> Self {
         debug_assert_eq!(data.len(), N * N, "from_flat: expected N*N elements");
         let mut m = Self::ZERO;
         for i in 0..N {
@@ -161,12 +159,12 @@ impl<const N: usize, const GRID: usize> Matrix<N, GRID> {
     }
 
     #[inline(always)]
-    pub fn get(&self, i: usize, j: usize) -> f32 {
+    pub fn get(&self, i: usize, j: usize) -> f64 {
         self.block(i / 4, j / 4).get(i % 4, j % 4)
     }
 
     #[inline(always)]
-    pub fn set(&mut self, i: usize, j: usize, val: f32) {
+    pub fn set(&mut self, i: usize, j: usize, val: f64) {
         *self.block_mut(i / 4, j / 4).get_mut(i % 4, j % 4) = val;
     }
 
@@ -353,9 +351,9 @@ impl<const N: usize, const GRID: usize> LUDecomp<N, GRID> {
 
     /// Solve A*x = b using the decomposition P*A = L*U.
     /// Apply permutation to b first, then forward/back substitute.
-    pub fn solve(&self, b: &VecF32<N>) -> VecF32<N> {
+    pub fn solve<const PAD: usize>(&self, b: &VecF64<N, PAD>) -> VecF64<N, PAD> {
         // Apply row permutation
-        let mut data: [f32; N] = [0.0; N];
+        let mut data: [f64; PAD] = [0.0; PAD];
         for i in 0..N {
             data[i] = b[self.perm[i]];
         }
@@ -376,7 +374,7 @@ impl<const N: usize, const GRID: usize> LUDecomp<N, GRID> {
             data[i] /= self.u.get(i, i);
         }
 
-        VecF32 { data }
+        VecF64 { data }
     }
 }
 
@@ -447,69 +445,67 @@ impl<'a, const N: usize, const GRID: usize> core::ops::Mul<Self> for &'a Matrix<
     }
 }
 
-impl<const N: usize, const GRID: usize> core::ops::Mul<VecF32<N>> for Matrix<N, GRID> {
-    type Output = VecF32<N>;
+impl<const N: usize, const GRID: usize, const PAD: usize> core::ops::Mul<VecF64<N, PAD>> for Matrix<N, GRID> {
+    type Output = VecF64<N, PAD>;
 
-    fn mul(self, rhs: VecF32<N>) -> VecF32<N> {
+    fn mul(self, rhs: VecF64<N, PAD>) -> VecF64<N, PAD> {
         let tiles = Self::TILES;
+        let x = &rhs.data;
+        let m = &self.blocks;
+        let mut out = VecF64::ZERO;
 
-        // ─── Pack vector into 4-wide tiles ───
-        let mut v_blocks = [[0f32; 4]; GRID];
-        let v_blocks = &mut v_blocks[..tiles];
-        for bc in 0..tiles {
-            let base = bc * 4;
-            for lane in 0..4 {
-                let gi = base + lane;
-                if gi < N {
-                    v_blocks[bc][lane] = rhs.data[gi];
+        for br in 0..tiles {
+            // Keep B scalar accumulators — but initialize as an array
+            // so the compiler sees them as a unit and packs into one vector reg
+            let mut acc = [0.0f64; B];
+
+            for bc in 0..tiles {
+                let block = &m[br * tiles + bc];
+                let xb = &x[bc * B..];
+
+                // Unroll k (the column index within the tile) explicitly
+                // Each row of the block is a contiguous [f64; B]
+                // Writing it this way makes the fmla structure obvious:
+                // acc[row] += dot(block_row[row], xb)
+                for row in 0..B {
+                    let r = &block.data[row * B..row * B + B];
+                    // This is a 4-wide dot product — should emit fmul+fmla×3
+                    acc[row] += r[0]*xb[0] + r[1]*xb[1] + r[2]*xb[2] + r[3]*xb[3];
                 }
             }
-        }
 
-        let mut out = VecF32::ZERO;
-
-        // ─── Block-row loop ───
-        for i in 0..tiles {
-            let mut acc0 = 0f32;
-            let mut acc1 = 0f32;
-            let mut acc2 = 0f32;
-            let mut acc3 = 0f32;
-
-            for k in 0..tiles {
-                let blk = self.block(i, k);
-                let vk  = v_blocks[k];
-
-                acc0 += blk.get(0, 0) * vk[0]
-                      + blk.get(0, 1) * vk[1]
-                      + blk.get(0, 2) * vk[2]
-                      + blk.get(0, 3) * vk[3];
-
-                acc1 += blk.get(1, 0) * vk[0]
-                      + blk.get(1, 1) * vk[1]
-                      + blk.get(1, 2) * vk[2]
-                      + blk.get(1, 3) * vk[3];
-
-                acc2 += blk.get(2, 0) * vk[0]
-                      + blk.get(2, 1) * vk[1]
-                      + blk.get(2, 2) * vk[2]
-                      + blk.get(2, 3) * vk[3];
-
-                acc3 += blk.get(3, 0) * vk[0]
-                      + blk.get(3, 1) * vk[1]
-                      + blk.get(3, 2) * vk[2]
-                      + blk.get(3, 3) * vk[3];
-            }
-
-            let base = i * 4;
-            let accs = [acc0, acc1, acc2, acc3];
-            for lane in 0..4 {
-                let gi = base + lane;
-                if gi < N {
-                    out.data[gi] = accs[lane];
-                }
+            let base = br * B;
+            for row in 0..B {
+                out[base + row] = acc[row];
             }
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod matrix_test {
+    use super::*;
+    use crate::{mat, vecf64};
+
+    #[test]
+    fn mat_mul() {
+        let mat = mat!((11) =>
+            3, 0, 1, 4, 9, 8, 0, 6, 9, 9, 2,
+            1, 1, 1, 5, 0, 7, 3, 1, 9, 3, 7,
+            5, 5, 0, 8, 0, 8, 5, 7, 0, 0, 2,
+            6, 0, 9, 3, 5, 1, 5, 1, 3, 5, 9,
+            6, 5, 6, 4, 6, 9, 7, 0, 9, 6, 9,
+            8, 8, 7, 1, 7, 7, 4, 8, 1, 3, 9,
+            5, 4, 4, 5, 2, 1, 6, 0, 6, 6, 4,
+            6, 0, 4, 3, 9, 3, 5, 3, 3, 9, 4,
+            1, 7, 6, 4, 3, 1, 0, 3, 2, 9, 9,
+            3, 5, 5, 0, 0, 2, 8, 6, 9, 5, 9,
+            0, 5, 9, 3, 0, 8, 1, 3, 1, 8, 2,
+        );
+        let vec = vecf64!((11, 4) => 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+        let mul = mat * vec;
+        println!("{mul:?}");
     }
 }

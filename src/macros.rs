@@ -1,11 +1,13 @@
 #[macro_export]
 macro_rules! mat {
-    (($n:literal)) => {
-        GridMatrix::<$n, { (($n + 3) / 4) * (($n + 3) / 4) }>::ZERO
-    };
-    (($n:literal) => $($val:literal),* $(,)?) => {
-        GridMatrix::<$n, { (($n + 3) / 4) * (($n + 3) / 4) }>::from_flat(&[$($val as f32),*])
-    };
+    (($n:literal)) => {{
+        const __GRID__: usize = (($n + 3) / 4) * (($n + 3) / 4);
+        Matrix::<$n, __GRID__>::ZERO
+    }};
+    (($n:literal) => $($val:literal),* $(,)?) => {{
+        const __GRID__: usize = (($n + 3) / 4) * (($n + 3) / 4);
+        Matrix::<$n, __GRID__>::from_flat(&[$($val as f64),*])
+    }};
 }
 
 #[macro_export]
@@ -20,20 +22,17 @@ macro_rules! vecf32 {
 
 #[macro_export]
 macro_rules! vecf64 {
-    () => {
-        VecF32 { data: [0f64; _] }
+    (($n:literal, $align:literal)) => {
+        VecF64 { data: [0f64; _] }
     };
-    ($($val:literal),* $(,)?) => {
-        VecF32 { data: [$($val as f64),*] }
-    };
-}
-
-#[macro_export]
-macro_rules! vecu32 {
-    () => {
-        VecU32 { data: [0; _] }
-    };
-    ($($val:literal),* $(,)?) => {
-        VecU32 { data: [$($val as u32),*] }
-    };
+    (($n:literal, $align:literal) => $($val:literal),* $(,)?) => {{
+        const __PAD__: usize = ($n + ($align - 1)) & !($align - 1);
+        let arr = &[$($val as f64),*];
+        let len = arr.len();
+        let mut data = [0f64; __PAD__];
+        for i in 0..len {
+            data[i] = arr[i];
+        }
+        VecF64::<$n, __PAD__> { data }
+    }};
 }
