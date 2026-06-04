@@ -1,38 +1,136 @@
 #[macro_export]
 macro_rules! mat {
-    (($n:literal)) => {{
-        const __GRID__: usize = (($n + 3) / 4) * (($n + 3) / 4);
-        Matrix::<$n, __GRID__>::ZERO
-    }};
-    (($n:literal) => $($val:literal),* $(,)?) => {{
-        const __GRID__: usize = (($n + 3) / 4) * (($n + 3) / 4);
-        Matrix::<$n, __GRID__>::from_flat(&[$($val as f64),*])
-    }};
-}
-
-#[macro_export]
-macro_rules! vecf32 {
     () => {
-        VecF32 { data: [0f32; _] }
+        Matrix::ZERO
     };
-    ($($val:literal),* $(,)?) => {
-        VecF32 { data: [$($val as f32),*] }
+    ($n:expr) => {
+        Matrix::<{ $n * $n }, $n, $n>::ZERO
+    };
+    ($row:expr, $col:expr) => {
+        Matrix::<{ $row * $col }, $row, $col>::ZERO
+    };
+    ($n:expr => $($val:literal),* $(,)?) => {
+        Matrix::<{ $n * $n }, $n, $n> { data: [$($val as f64),*] }
+    };
+    (($row:expr, $col:expr) => $($val:expr),* $(,)?) => {
+        Matrix::<{ $row * $col }, $row, $col> { data: [$($val),*] }
+    };
+    ($n:expr => $arr:expr) => {
+        Matrix::<{ $n * $n }, $n, $n> { data: $arr }
     };
 }
 
 #[macro_export]
-macro_rules! vecf64 {
-    (($n:literal, $align:literal)) => {
-        VecF64 { data: [0f64; _] }
-    };
-    (($n:literal, $align:literal) => $($val:literal),* $(,)?) => {{
-        const __PAD__: usize = ($n + ($align - 1)) & !($align - 1);
-        let arr = &[$($val as f64),*];
-        let len = arr.len();
-        let mut data = [0f64; __PAD__];
-        for i in 0..len {
-            data[i] = arr[i];
-        }
-        VecF64::<$n, __PAD__> { data }
+macro_rules! incidence {
+    (($rows:expr, $cols:expr) => $(($($c1:expr)?, $($c2:expr)?)),* $(,)?) => {{
+        $($(const _: () = debug_assert!($c1 < $cols);)?)*
+        $($(const _: () = debug_assert!($c2 < $cols);)?)*
+
+        let mut m: Matrix<{ $rows * $cols }, $rows, $cols> = Matrix::ZERO;
+        let mut i = 0;
+        $(
+            $(m.data[i * $cols + $c1] = 1.0;)?
+            $(m.data[i * $cols + $c2] = -1.0;)?
+            i += 1;
+        )*
+        m
     }};
+}
+
+#[macro_export]
+macro_rules! t_incidence {
+    (($rows:expr, $cols:expr) => $(($($c1:expr)?, $($c2:expr)?)),* $(,)?) => {{
+        $($(const _: () = debug_assert!($c1 < $rows);)?)*
+        $($(const _: () = debug_assert!($c2 < $rows);)?)*
+
+        let mut m: Matrix<{ $rows * $cols }, $rows, $cols> = Matrix::ZERO;
+        let mut i = 0;
+        $(
+            $(m.data[$c1 * $cols + i] = 1.0;)?
+            $(m.data[$c2 * $cols + i] = -1.0;)?
+            i += 1;
+        )*
+        m
+    }};
+}
+
+#[macro_export]
+macro_rules! diagonal {
+    (($rows:expr, $cols:expr) => $($val:expr),* $(,)?) => {{
+        let mut m: Matrix<{ $rows * $cols }, $rows, $cols> = Matrix::ZERO;
+        let mut i = 0usize;
+        $(
+            m.data[i * $cols + i] = $val;
+            i += 1;
+        )*
+        m
+    }};
+}
+
+#[macro_export]
+macro_rules! create_mat {
+    ($name:ident => $row:ident, $col:ident) => {
+        type $name = Matrix<{ $row * $col }, $row, $col>;
+    };
+    ($name:ident => $row:expr, $col:expr) => {
+        type $name = Matrix<{ $row * $col }, $row, $col>;
+    };
+}
+
+#[macro_export]
+macro_rules! vecf {
+    () => {
+        VecF { data: [0.0; _] }
+    };
+    ([$val:literal; $n:literal]) => {
+        VecF { data: [$val as f64; $n] }
+    };
+    ($n:literal => $($val:literal),* $(,)?) => {
+        VecF::<$n> { data: [$($val as f64),*] }
+    };
+    ($n:literal => $($val:ident),* $(,)?) => {
+        VecF::<$n> { data: [$($val),*] }
+    };
+    ($arr:expr) => {
+        VecF { data: $arr }
+    };
+}
+
+#[macro_export]
+macro_rules! vecu {
+    () => {
+        VecU { data: [0; _] }
+    };
+    (($n:literal)) => {
+        VecU::<$n> { data: [0; $n] }
+    };
+    ($n:literal => $($val:literal),* $(,)?) => {
+        VecU::<$n> { data: [$($val as usize),*] }
+    };
+}
+
+#[macro_export]
+macro_rules! vecb {
+    () => {
+        VecBool { data: [false; _] }
+    };
+    ([$val:literal; $n:literal]) => {
+        VecBool { data: [$val; $n] }
+    };
+    ($n:literal => $($val:literal),* $(,)?) => {
+        VecBool::<$n> { data: [$($val),*] }
+    };
+    ($arr:expr) => {
+        VecBool { data: $arr }
+    };
+}
+
+#[macro_export]
+macro_rules! create_vec {
+    ($name:ident => [f64; $n:literal]) => {
+        type $name = VecF<$n>;
+    };
+    ($name:ident => [usize; $n:literal]) => {
+        type $name = VecU<$n>;
+    };
 }

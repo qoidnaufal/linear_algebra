@@ -1,511 +1,620 @@
-//! Blocked LU decomposition with partial pivoting.
-//!
-//! # Quick start
-//!
-//! ```rust
-//! mat!(Mat11, 11);   // 11×11, 4×4 blocks → 3×3 = 9 blocks
-//! mat!(Mat20, 20);   // 20×20, 4×4 blocks → 5×5 = 25 blocks
-//!
-//! let src  = Mat11::from_flat(&my_floats);
-//! let lu   = lu_decompose(&src);
-//! // invariant: P * src ≈ lu.l * lu.u
-//! ```
-//!
-//! # Layout
-//!
-//! Each matrix is stored as a `num_tiles(N) × num_tiles(N)` grid of 4×4 `Block`s.
-//! Every `Block` is exactly one 64-byte cache line.
-//! Padding blocks (for N that isn't a multiple of 4) stay zero and are
-//! never written to during factorisation.
+#[cfg(target_feature = "neon")]
+use core::arch::aarch64::*;
+use crate::vector::VecF;
 
-use crate::vector::VecF64;
+// =============================================================================
+// Matrix
+// =============================================================================
 
-const B: usize = 4;
-const BS: usize = B * B;
-
-#[repr(align(64))]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Block {
-    pub data: [f64; 16],
-}
-
-impl Block {
-    pub const ZERO: Self = Self { data: [0f64; 16] };
-    pub const IDENTITY: Self = {
-        let mut d = [0f64; 16];
-        d[0] = 1.0;
-        d[5] = 1.0;
-        d[10] = 1.0;
-        d[15] = 1.0;
-        Self { data: d }
-    };
-
-    #[inline(always)]
-    pub fn get(&self, row: usize, col: usize) -> f64 {
-        // 4 comes from 4x4 block
-        unsafe { *self.data.get_unchecked(row * 4 + col) }
-    }
-
-    #[inline(always)]
-    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f64 {
-        // 4 comes from 4x4 block
-        unsafe { self.data.get_unchecked_mut(row * 4 + col) }
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, row: usize, col: usize, val: f64) {
-        // 4 comes from 4x4 block
-        unsafe { *self.data.get_unchecked_mut(row * 4 + col) = val }
-    }
-
-    #[inline(always)]
-    pub fn mulsub_assign(&mut self, a: &Self, b: &Self) {
-        // 4 comes from 4x4 block
-        for k in 0..4 {
-            let b_row = [b.get(k, 0), b.get(k, 1), b.get(k, 2), b.get(k, 3)];
-            for i in 0..4 {
-                let aik = a.get(i, k);
-                self.data[i * 4] -= aik * b_row[0];
-                self.data[i * 4 + 1] -= aik * b_row[1];
-                self.data[i * 4 + 2] -= aik * b_row[2];
-                self.data[i * 4 + 3] -= aik * b_row[3];
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn muladd_assign(&mut self, a: &Self, b: &Self) {
-        for k in 0..4 {
-            let b_row = [b.get(k, 0), b.get(k, 1), b.get(k, 2), b.get(k, 3)];
-            for i in 0..4 {
-                let aik = a.get(i, k);
-                self.data[i * 4] += aik * b_row[0];
-                self.data[i * 4 + 1] += aik * b_row[1];
-                self.data[i * 4 + 2] += aik * b_row[2];
-                self.data[i * 4 + 3] += aik * b_row[3];
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn swap_rows(&mut self, r1: usize, r2: usize) {
-        if r1 == r2 {
-            return;
-        }
-        for c in 0..4 {
-            self.data.swap(r1 * 4 + c, r2 * 4 + c);
-        }
-    }
-
-    #[inline(always)]
-    pub fn swap_rows_with(&mut self, r1: usize, other: &mut Self, r2: usize) {
-        for c in 0..4 {
-            let tmp = self.data[r1 * 4 + c];
-            self.data[r1 * 4 + c] = other.data[r2 * 4 + c];
-            other.data[r2 * 4 + c] = tmp;
-        }
-    }
-}
-
-#[repr(align(64))]
+/// A row-major matrix with `ROW` rows and `COL` columns, stored in flat array.
+/// `LEN` must equal `ROW * COL`. `COL` defaults to `ROW` for square matrices.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Square 7x7
+/// const N: usize = 7;
+/// const LEN: usize = N * N;
+/// type Mat7 = Matrix2<LEN, N>;
+/// let m = Mat7::IDENTITY;
+///
+/// // Rectangular 3x5
+/// const ROW: usize = 3;
+/// const COL: usize = 5;
+/// const LEN: usize = ROW * COL;
+/// type Mat3x5 = Matrix2<LEN, ROW, COL>;
+/// let z = Mat3x5::ZERO;
+/// ```
+#[repr(align(32))]
 #[derive(Clone, Copy)]
-pub struct Matrix<const N: usize, const GRID: usize> {
-    pub blocks: [Block; GRID],
+pub struct Matrix<const LEN: usize, const ROW: usize, const COL: usize = ROW> {
+    /// Row-major storage.
+    pub data: [f64; LEN],
 }
 
-impl<const N: usize, const GRID: usize> Matrix<N, GRID> {
-    pub const TILES: usize = crate::num_tiles(N);
+// =============================================================================
+// General impl (any ROW x COL)
+// =============================================================================
 
-    pub const ZERO: Self = Self { blocks: [Block::ZERO; GRID] };
+impl<const LEN: usize, const ROW: usize, const COL: usize> Matrix<LEN, ROW, COL> {
+    pub const ZERO: Self = Self { data: [0.0; LEN] };
 
-    pub const IDENTITY: Self = {
-        let mut m = Self::ZERO;
+    pub const fn split_at_mut(&mut self, mid: usize) -> (&mut [f64], &mut [f64]) {
+        unsafe { self.data.split_at_mut_unchecked(mid) }
+    }
+
+    pub const fn as_slice(&self) -> &[f64] {
+        self.data.as_slice()
+    }
+
+    pub fn rows(&self) -> core::slice::ChunksExact<'_, f64> {
+        self.data.chunks_exact(COL)
+    }
+
+    pub fn rows_mut(&mut self) -> core::slice::ChunksExactMut<'_, f64> {
+        self.data.chunks_exact_mut(COL)
+    }
+
+    pub fn scalar_mul(&self, scalar: f64) -> Self {
+        let mut result = Self::ZERO;
+        for row in 0..ROW {
+            let offset = row * COL;
+            for col in 0..COL {
+                result[offset + col] = self[offset + col] * scalar;
+            }
+        }
+        result
+    }
+
+    pub fn scalar_add(&self, scalar: f64) -> Self {
+        let mut result = Self::ZERO;
+        for row in 0..ROW {
+            let offset = row * COL;
+            for col in 0..COL {
+                result[offset + col] = self[offset + col] + scalar
+            }
+        }
+        result
+    }
+
+    pub fn mat_sub(&self, rhs: &Self) -> Self {
+        let mut result = Self::ZERO;
+        for row in 0..ROW {
+            let offset = row * COL;
+            for col in 0..COL {
+                result.data[offset + col] = self.data[offset + col] - rhs.data[offset + col];
+            }
+        }
+        result
+    }
+
+    pub const fn expand<
+        const LEN2: usize,
+        const ROW2: usize,
+        const COL2: usize
+    >(&self) -> Matrix<LEN2, ROW2, COL2> {
+        let mut new = Matrix::ZERO;
         let mut i = 0;
-        while i < Self::TILES {
-            m.blocks[i * Self::TILES + i] = Block::IDENTITY;
-            i += 1
-        };
-        m
-    };
-
-    /// Construct the identity matrix at runtime (const IDENTITY was buggy; use this).
-    pub fn identity() -> Self {
-        let mut m = Self::ZERO;
-        for t in 0..Self::TILES {
-            *m.block_mut(t, t) = Block::IDENTITY;
+        while i < ROW {
+            let src_offset = i * COL;
+            let dst_offset = i * COL2;
+            unsafe {
+                let src = self.data.as_ptr().add(src_offset);
+                let dst = new.data.as_mut_ptr().add(dst_offset);
+                core::ptr::copy_nonoverlapping(src, dst, COL);
+            }
+            i += 1;
         }
-        m
+        new
     }
 
-    pub fn from_flat(data: &[f64]) -> Self {
-        debug_assert_eq!(data.len(), N * N, "from_flat: expected N*N elements");
-        let mut m = Self::ZERO;
-        for i in 0..N {
-            for j in 0..N {
-                m.set(i, j, data[i * N + j]);
-            }
-        }
-        m
-    }
+    pub fn transpose(&self) -> Matrix<LEN, COL, ROW> {
+        let mut out = Matrix::<LEN, COL, ROW>::ZERO;
 
-    #[inline(always)]
-    pub fn block(&self, br: usize, bc: usize) -> &Block {
-        unsafe { self.blocks.get_unchecked(br * Self::TILES + bc) }
-    }
+        for r_tile in (0..ROW).step_by(8) {
+            for c_tile in (0..COL).step_by(8) {
+                let r_end = (r_tile + 8).min(ROW);
+                let c_end = (c_tile + 8).min(COL);
 
-    #[inline(always)]
-    pub fn block_mut(&mut self, br: usize, bc: usize) -> &mut Block {
-        unsafe { self.blocks.get_unchecked_mut(br * Self::TILES + bc) }
-    }
-
-    #[inline(always)]
-    pub fn get(&self, i: usize, j: usize) -> f64 {
-        self.block(i / 4, j / 4).get(i % 4, j % 4)
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, i: usize, j: usize, val: f64) {
-        *self.block_mut(i / 4, j / 4).get_mut(i % 4, j % 4) = val;
-    }
-
-    pub fn swap_rows(&mut self, r1: usize, r2: usize) {
-        if r1 == r2 {
-            return;
-        }
-        let (br1, lr1) = (r1 / 4, r1 % 4);
-        let (br2, lr2) = (r2 / 4, r2 % 4);
-        let tiles = Self::TILES;
-        if br1 == br2 {
-            for bc in 0..tiles {
-                self.block_mut(br1, bc).swap_rows(lr1, lr2);
-            }
-        } else {
-            for bc in 0..tiles {
-                let i1 = br1 * tiles + bc;
-                let i2 = br2 * tiles + bc;
-                unsafe {
-                    let p1 = self.blocks.get_unchecked_mut(i1) as *mut Block;
-                    let p2 = self.blocks.get_unchecked_mut(i2) as *mut Block;
-                    (*p1).swap_rows_with(lr1, &mut *p2, lr2);
-                }
-            }
-        }
-    }
-
-    pub fn lu_decompose(&self) -> LUDecomp<N, GRID> {
-        LUDecomp::new(self)
-    }
-}
-
-pub struct LUDecomp<const N: usize, const GRID: usize> {
-    pub l: Matrix<N, GRID>,
-    pub u: Matrix<N, GRID>,
-    /// perm[i] = original row index that ended up at row i after pivoting.
-    pub perm: [usize; N],
-}
-
-/// Solve L * X = B in-place for a single 4x4 lower-unit-triangular block.
-/// Forward substitution, column-major inner loop.
-#[inline]
-fn trsm_left_lower(l_blk: &Block, target: &mut Block) {
-    for j in 0..4 {
-        for k in 0..4 {
-            let tkj = target.get(k, j);
-            for i in k + 1..4 {
-                *target.get_mut(i, j) -= l_blk.get(i, k) * tkj;
-            }
-        }
-    }
-}
-
-/// Solve X * U = B in-place for a single 4x4 upper-triangular block.
-/// Back substitution: process columns right-to-left.
-#[inline]
-fn trsm_right_upper(u_blk: &Block, target: &mut Block) {
-    for i in 0..4 {
-        for k in (0..4).rev() {
-            let inv_ukk = 1.0 / u_blk.get(k, k);
-            let tik = target.get(i, k) * inv_ukk;
-            *target.get_mut(i, k) = tik;
-            // Subtract known contributions from columns to the left of k
-            for j in 0..k {
-                *target.get_mut(i, j) -= tik * u_blk.get(k, j);
-            }
-        }
-    }
-}
-
-impl<const N: usize, const GRID: usize> LUDecomp<N, GRID> {
-    pub fn new(src: &Matrix<N, GRID>) -> Self {
-        let tiles = Matrix::<N, GRID>::TILES;
-        let mut a = *src;
-        let mut perm: [usize; N] = core::array::from_fn(|i| i);
-
-        for k in 0..tiles {
-            let row_base = k * 4;
-            let tile_rows = (N - row_base).min(4);
-
-            for step in 0..tile_rows {
-                let global_step = row_base + step;
-
-                let mut max_abs = a.get(global_step, global_step).abs();
-                let mut pivot_global = global_step;
-
-                // Search all rows below global_step in this column
-                for i in global_step + 1..N {
-                    let v = a.get(i, global_step).abs();
-                    if v > max_abs {
-                        max_abs = v;
-                        pivot_global = i;
-                    }
-                }
-
-                if pivot_global != global_step {
-                    a.swap_rows(global_step, pivot_global);
-                    perm.swap(global_step, pivot_global);
-                }
-
-                // Eliminate within this column, rows global_step+1 .. row_base+tile_rows
-                let pivot = a.get(global_step, global_step);
-                if pivot == 0.0 {
-                    continue;
-                }
-                let inv_pivot = 1.0 / pivot;
-
-                for i in global_step + 1..row_base + tile_rows {
-                    let m = a.get(i, global_step) * inv_pivot;
-                    a.set(i, global_step, m);
-                    for j in global_step + 1..row_base + 4 {
-                        let u = a.get(global_step, j);
-                        a.set(i, j, a.get(i, j) - m * u);
-                    }
-                }
-            }
-
-            // trsm: update blocks to the right of the diagonal (solve L * U_kj = A_kj)
-            for j in k + 1..tiles {
-                let diag_idx = k * tiles + k;
-                let tgt_idx = k * tiles + j;
-                debug_assert!(diag_idx < tgt_idx);
-                let (left, right) = a.blocks.split_at_mut(tgt_idx);
-                trsm_left_lower(&left[diag_idx], &mut right[0]);
-            }
-
-            // trsm: update blocks below the diagonal (solve L_ik * U = A_ik)
-            for i in k + 1..tiles {
-                let diag_idx = k * tiles + k;
-                let tgt_idx = i * tiles + k;
-                debug_assert!(diag_idx < tgt_idx);
-                let (left, right) = a.blocks.split_at_mut(tgt_idx);
-                trsm_right_upper(&left[diag_idx], &mut right[0]);
-            }
-
-            // Schur complement update for trailing submatrix
-            for i in k + 1..tiles {
-                let ik_idx = i * tiles + k;
-                let aik = a.blocks[ik_idx];
-                for j in k + 1..tiles {
-                    let kj_idx = k * tiles + j;
-                    let ij_idx = i * tiles + j;
-                    debug_assert!(kj_idx != ij_idx);
-                    let (left, right) = a.blocks.split_at_mut(ij_idx);
-                    right[0].mulsub_assign(&aik, &left[kj_idx]);
-                }
-            }
-        }
-
-        // --- Extract L and U from combined storage ---
-        let mut l = Matrix::<N, GRID>::IDENTITY;
-        let mut u = Matrix::<N, GRID>::ZERO;
-
-        for bi in 0..tiles {
-            for bj in 0..tiles {
-                let blk = a.block(bi, bj);
-                if bi < bj {
-                    // Entirely above diagonal: belongs to U
-                    *u.block_mut(bi, bj) = *blk;
-                } else if bi > bj {
-                    // Entirely below diagonal: belongs to L
-                    *l.block_mut(bi, bj) = *blk;
-                } else {
-                    // Diagonal block: split by r <= c (U) vs r > c (L)
-                    let ub = u.block_mut(bi, bj);
-                    let lb = l.block_mut(bi, bj);
-                    for r in 0..4 {
-                        for c in 0..4 {
-                            let v = blk.get(r, c);
-                            if r <= c {
-                                ub.set(r, c, v);
-                            } else {
-                                lb.set(r, c, v);
-                                // L diagonal stays 1.0 from identity() above
-                            }
-                        }
+                for r in r_tile..r_end {
+                    let r_offset = r * COL;
+                    for c in c_tile..c_end {
+                        out[c * ROW + r] = self[r_offset + c];
                     }
                 }
             }
         }
-
-        LUDecomp { l, u, perm }
-    }
-
-    /// Solve A*x = b using the decomposition P*A = L*U.
-    /// Apply permutation to b first, then forward/back substitute.
-    pub fn solve<const PAD: usize>(&self, b: &VecF64<N, PAD>) -> VecF64<N, PAD> {
-        // Apply row permutation
-        let mut data: [f64; PAD] = [0.0; PAD];
-        for i in 0..N {
-            data[i] = b[self.perm[i]];
-        }
-
-        // Forward substitution: solve L*y = Pb
-        for i in 0..N {
-            for j in 0..i {
-                data[i] -= self.l.get(i, j) * data[j];
-            }
-            // L diagonal is 1, no division needed
-        }
-
-        // Back substitution: solve U*x = y
-        for i in (0..N).rev() {
-            for j in i + 1..N {
-                data[i] -= self.u.get(i, j) * data[j];
-            }
-            data[i] /= self.u.get(i, i);
-        }
-
-        VecF64 { data }
-    }
-}
-
-impl<const N: usize, const GRID: usize> core::fmt::Debug for Matrix<N, GRID> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "Matrix<{N}x{N}> => {GRID} blocks")?;
-        for i in 0..N {
-            write!(f, "  │")?;
-            for j in 0..N { write!(f, "{:6.2}", self.get(i, j))? }
-            writeln!(f, "  │")?;
-        }
-        Ok(())
-    }
-}
-
-impl<const N: usize, const GRID: usize> core::fmt::Debug for LUDecomp<N, GRID> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "L: {:?}", self.l)?;
-        write!(f, "U: {:?}", self.u)
-    }
-}
-
-impl<const N: usize, const GRID: usize> PartialEq for Matrix<N, GRID> {
-    fn eq(&self, other: &Self) -> bool {
-        self.blocks.iter()
-            .zip(&other.blocks)
-            .all(|(a, b)| a == b)
-    }
-}
-
-impl<const N: usize, const GRID: usize> Eq for Matrix<N, GRID> {}
-
-impl<const N: usize, const GRID: usize> core::ops::Mul<Self> for Matrix<N, GRID> {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        let mut c = Matrix::<N, GRID>::ZERO;
-        for i in 0..N {
-            for k in 0..N {
-                let aik = self.get(i, k);
-                if aik == 0.0 {
-                    continue;
-                }
-                for j in 0..N {
-                    c.set(i, j, c.get(i, j) + aik * rhs.get(k, j));
-                }
-            }
-        }
-        c
-    }
-}
-
-impl<'a, const N: usize, const GRID: usize> core::ops::Mul<Self> for &'a Matrix<N, GRID> {
-    type Output = Matrix::<N, GRID>;
-    fn mul(self, rhs: Self) -> Self::Output {
-        let mut c = Matrix::<N, GRID>::ZERO;
-        for i in 0..N {
-            for k in 0..N {
-                let aik = self.get(i, k);
-                if aik == 0.0 {
-                    continue;
-                }
-                for j in 0..N {
-                    c.set(i, j, c.get(i, j) + aik * rhs.get(k, j));
-                }
-            }
-        }
-        c
-    }
-}
-
-impl<const N: usize, const GRID: usize, const PAD: usize> core::ops::Mul<VecF64<N, PAD>> for Matrix<N, GRID> {
-    type Output = VecF64<N, PAD>;
-
-    fn mul(self, rhs: VecF64<N, PAD>) -> VecF64<N, PAD> {
-        let tiles = Self::TILES;
-        let x = &rhs.data;
-        let m = &self.blocks;
-        let mut out = VecF64::ZERO;
-
-        for br in 0..tiles {
-            // Keep B scalar accumulators — but initialize as an array
-            // so the compiler sees them as a unit and packs into one vector reg
-            let mut acc = [0.0f64; B];
-
-            for bc in 0..tiles {
-                let block = &m[br * tiles + bc];
-                let xb = &x[bc * B..];
-
-                // Unroll k (the column index within the tile) explicitly
-                // Each row of the block is a contiguous [f64; B]
-                // Writing it this way makes the fmla structure obvious:
-                // acc[row] += dot(block_row[row], xb)
-                for row in 0..B {
-                    let r = &block.data[row * B..row * B + B];
-                    // This is a 4-wide dot product — should emit fmul+fmla×3
-                    acc[row] += r[0]*xb[0] + r[1]*xb[1] + r[2]*xb[2] + r[3]*xb[3];
-                }
-            }
-
-            let base = br * B;
-            for row in 0..B {
-                out[base + row] = acc[row];
-            }
-        }
-
         out
+    }
+}
+
+// =============================================================================
+// Const operations
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> Matrix<LEN, ROW, COL> {
+    pub const fn const_matmul<
+        const ROW_X_COL2: usize,
+        const LEN2: usize,
+        const COL2: usize,
+    >(&self, rhs: &Matrix<LEN2, COL, COL2>) -> Matrix<ROW_X_COL2, ROW, COL2> {
+        let mut result = Matrix::ZERO;
+        let mut i = 0;
+        while i < ROW {
+            let mut k = 0;
+            while k < COL {
+                let a_val = self.data[i * COL + k];
+                let mut j = 0;
+                while j < COL2 {
+                    result.data[i * COL2 + j] += a_val * rhs.data[k * COL2 + j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            i += 1;
+        }
+        result
+    }
+
+    pub const fn const_transpose(&self) -> Matrix<LEN, COL, ROW> {
+        let mut out = Matrix::<LEN, COL, ROW>::ZERO;
+
+        let mut r_tile = 0;
+        while r_tile < ROW {
+            let mut c_tile = 0;
+            while c_tile < COL {
+                let r_end = if r_tile + 8 < ROW { r_tile + 8 } else { ROW };
+                let c_end = if c_tile + 8 < COL { c_tile + 8 } else { COL };
+
+                let mut r = r_tile;
+                while r < r_end {
+                    let r_offset = r * COL;
+                    let mut c = c_tile;
+                    while c < c_end {
+                        out.data[c * ROW + r] = self.data[r_offset + c];
+                        c += 1;
+                    }
+                    r += 1;
+                }
+
+                c_tile += 8;
+            }
+
+            r_tile += 8;
+        }
+        out
+    }
+}
+
+// =============================================================================
+// Arithmetic Non-Neon
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> Matrix<LEN, ROW, COL> {
+    pub fn matmul<
+        const ROW_X_COL2: usize,
+        const LEN2: usize,
+        const COL2: usize,
+    >(&self, rhs: &Matrix<LEN2, COL, COL2>) -> Matrix<ROW_X_COL2, ROW, COL2> {
+        let mut result = Matrix::ZERO;
+        for i in 0..ROW {
+            for k in 0..COL {
+                let a_val = self[i * COL + k];
+                for j in 0..COL2 {
+                    result[i * COL2 + j] += a_val * rhs[k * COL2 + j];
+                }
+            }
+        }
+        result
+    }
+
+    pub fn matmul_into<
+        const LEN3: usize,
+        const LEN2: usize,
+        const COL2: usize,
+    >(
+        &self,
+        rhs: &Matrix<LEN2, COL, COL2>,
+        result: &mut Matrix<LEN3, ROW, COL2>,
+    ) {
+        *result = Matrix::ZERO;
+        for i in 0..ROW {
+            for k in 0..COL {
+                let a_val = self[i * COL + k];
+                for j in 0..COL2 {
+                    let b_val = rhs[k * COL2 + j];
+                    result[i * COL2 + j] += a_val * b_val;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Identity is only available on square matrix
+// =============================================================================
+
+impl<const LEN: usize, const N: usize> Matrix<LEN, N> {
+    pub const IDENTITY: Self = {
+        let mut this = Self::ZERO;
+        let mut i = 0;
+        while i < N {
+            this.data[i * N + i] = 1.0;
+            i += 1;
+        }
+        this
+    };
+}
+
+// =============================================================================
+// Index / IndexMut
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Index<usize>
+    for Matrix<LEN, ROW, COL>
+{
+    type Output = f64;
+    fn index(&self, index: usize) -> &f64 {
+        unsafe { self.data.get_unchecked(index) }
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::IndexMut<usize>
+    for Matrix<LEN, ROW, COL>
+{
+    fn index_mut(&mut self, index: usize) -> &mut f64 {
+        unsafe { self.data.get_unchecked_mut(index) }
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize>
+    core::ops::Index<core::ops::Range<usize>> for Matrix<LEN, ROW, COL>
+{
+    type Output = [f64];
+    fn index(&self, index: core::ops::Range<usize>) -> &[f64] {
+        unsafe { self.data.get_unchecked(index) }
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize>
+    core::ops::IndexMut<core::ops::Range<usize>> for Matrix<LEN, ROW, COL>
+{
+    fn index_mut(&mut self, index: core::ops::Range<usize>) -> &mut [f64] {
+        unsafe { self.data.get_unchecked_mut(index) }
+    }
+}
+
+// =============================================================================
+// IntoIterator
+// =============================================================================
+
+impl<'a, const LEN: usize, const ROW: usize, const COL: usize> IntoIterator
+    for &'a Matrix<LEN, ROW, COL>
+{
+    type Item = &'a [f64];
+    type IntoIter = core::slice::ChunksExact<'a, f64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows()
+    }
+}
+
+impl<'a, const LEN: usize, const ROW: usize, const COL: usize> IntoIterator
+    for &'a mut Matrix<LEN, ROW, COL>
+{
+    type Item = &'a mut [f64];
+    type IntoIter = core::slice::ChunksExactMut<'a, f64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows_mut()
+    }
+}
+
+// =============================================================================
+// Addition
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Add<Self>
+    for Matrix<LEN, ROW, COL>
+{
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        mat_add(&self, &rhs)
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Add<Matrix<LEN, ROW, COL>>
+    for &Matrix<LEN, ROW, COL>
+{
+    type Output = Matrix<LEN, ROW, COL>;
+
+    fn add(self, rhs: Matrix<LEN, ROW, COL>) -> Self::Output {
+        mat_add(self, &rhs)
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Add<Self>
+    for &Matrix<LEN, ROW, COL>
+{
+    type Output = Matrix<LEN, ROW, COL>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        mat_add(self, rhs)
+    }
+}
+
+fn mat_add<
+    const LEN: usize,
+    const ROW: usize,
+    const COL: usize
+>(
+    lhs: &Matrix<LEN, ROW, COL>,
+    rhs: &Matrix<LEN, ROW, COL>
+) -> Matrix<LEN, ROW, COL> {
+    let mut result = Matrix::ZERO;
+    for row in 0..ROW {
+        let offset = row * COL;
+        for col in 0..COL {
+            result[offset + col] = lhs[offset + col] + rhs[offset + col]
+        }
+    }
+    result
+}
+
+// =============================================================================
+// Substraction
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Sub<Self>
+    for Matrix<LEN, ROW, COL>
+{
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.mat_sub(&rhs)
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Sub<Matrix<LEN, ROW, COL>>
+    for &Matrix<LEN, ROW, COL>
+{
+    type Output = Matrix<LEN, ROW, COL>;
+
+    fn sub(self, rhs: Matrix<LEN, ROW, COL>) -> Self::Output {
+        self.mat_sub(&rhs)
+    }
+}
+
+// =============================================================================
+// Matmul: Matrix x Vec
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Mul<VecF<COL>>
+    for Matrix<LEN, ROW, COL>
+{
+    type Output = VecF<ROW>;
+
+    fn mul(self, rhs: VecF<COL>) -> VecF<ROW> {
+        mat_vec_mul(&self, &rhs)
+    }
+}
+
+impl<'a, const LEN: usize, const ROW: usize, const COL: usize> core::ops::Mul<VecF<COL>>
+    for &'a Matrix<LEN, ROW, COL>
+{
+    type Output = VecF<ROW>;
+
+    fn mul(self, rhs: VecF<COL>) -> VecF<ROW> {
+        mat_vec_mul(self, &rhs)
+    }
+}
+
+impl<'a, const LEN: usize, const ROW: usize, const COL: usize> core::ops::Mul<&'a VecF<COL>>
+    for &'a Matrix<LEN, ROW, COL>
+{
+    type Output = VecF<ROW>;
+
+    fn mul(self, rhs: &VecF<COL>) -> VecF<ROW> {
+        mat_vec_mul(self, rhs)
+    }
+}
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> core::ops::Mul<&VecF<COL>>
+    for Matrix<LEN, ROW, COL>
+{
+    type Output = VecF<ROW>;
+
+    fn mul(self, rhs: &VecF<COL>) -> VecF<ROW> {
+        mat_vec_mul(&self, rhs)
+    }
+}
+
+#[cfg(target_feature = "neon")]
+fn mat_vec_mul<const LEN: usize, const ROW: usize, const COL: usize>(
+    mat: &Matrix<LEN, ROW, COL>,
+    rhs: &VecF<COL>,
+) -> VecF<ROW> {
+    let mut res = VecF::<ROW>::ZERO;
+
+    for i in 0..ROW {
+        let offset = i * COL;
+        let mut acc0 = unsafe { vdupq_n_f64(0.0) };
+        let mut acc1 = unsafe { vdupq_n_f64(0.0) };
+
+        let mut j = 0;
+
+        while j + 4 <= COL {
+            unsafe {
+                let m_vec = vld1q_f64_x2(mat.data.as_ptr().add(offset + j));
+                let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(j));
+                acc0 = vfmaq_f64(acc0, m_vec.0, r_vec.0);
+                acc1 = vfmaq_f64(acc1, m_vec.1, r_vec.1);
+            }
+            j += 4;
+        }
+
+        let mut acc = unsafe { vaddq_f64(acc0, acc1) };
+
+        while j + 2 <= COL {
+            unsafe {
+                let m_vec = vld1q_f64(mat.data.as_ptr().add(offset + j));
+                let r_vec = vld1q_f64(rhs.data.as_ptr().add(j));
+                acc = vfmaq_f64(acc, m_vec, r_vec);
+            }
+            j += 2;
+        }
+
+        let mut dot = unsafe { vaddvq_f64(acc) };
+
+        if j < COL {
+            dot += mat[offset + j] * rhs[j];
+        }
+
+        res[i] = dot;
+    }
+
+    res
+}
+
+#[cfg(not(target_feature = "neon"))]
+fn mat_vec_mul<const LEN: usize, const ROW: usize, const COL: usize>(
+    mat: &Matrix<LEN, ROW, COL>,
+    rhs: &VecF<COL>,
+) -> VecF<ROW> {
+    let mut out = VecF::ZERO;
+
+    for row in 0..ROW {
+        let offset = row * COL;
+        let mut acc = 0.0;
+        for col in 0..COL {
+            acc += mat[offset + col] * rhs[col]
+        }
+        out[row] = acc
+    }
+
+    out
+}
+
+// =============================================================================
+// Matmul: Square Matrices
+// =============================================================================
+
+impl<const LEN: usize, const N: usize> core::ops::Mul for Matrix<LEN, N> {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        self.matmul(&rhs)
+    }
+}
+
+impl<const LEN: usize, const N: usize> core::ops::Mul<&Self> for Matrix<LEN, N> {
+    type Output = Self;
+
+    fn mul(self, rhs: &Self) -> Self::Output {
+        self.matmul(rhs)
+    }
+}
+
+impl<const LEN: usize, const N: usize> core::ops::Mul<Self> for &Matrix<LEN, N> {
+    type Output = Matrix<LEN, N>;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        self.matmul(rhs)
+    }
+}
+
+impl<const LEN: usize, const N: usize> core::ops::Mul<Matrix<LEN, N>> for &Matrix<LEN, N> {
+    type Output = Matrix<LEN, N>;
+
+    fn mul(self, rhs: Matrix<LEN, N>) -> Self::Output {
+        self.matmul(&rhs)
+    }
+}
+
+// =============================================================================
+// PartialEq
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> PartialEq
+    for Matrix<LEN, ROW, COL>
+{
+    fn eq(&self, other: &Self) -> bool {
+        &self.data == &other.data
+    }
+}
+
+// =============================================================================
+// Debug: this is highly inefficient but whatever
+// =============================================================================
+
+impl<const LEN: usize, const ROW: usize, const COL: usize> std::fmt::Debug
+    for Matrix<LEN, ROW, COL>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Matrix<{ROW}×{COL}>")?;
+        let mut max_len = 0;
+        let s = self.rows().map(|row| {
+            row.iter().map(|val| {
+                let space = if val.is_sign_negative() { 0 } else { 1 };
+                let st = format!(" {:space$}{val:.2e} ", "");
+                let len = st.len();
+                if len > max_len { max_len = len }
+                st
+            })
+            .collect::<Box<[_]>>()
+        })
+        .collect::<Box<[_]>>();
+        s.iter().try_for_each(|row| {
+            write!(f, " │")?;
+            row.iter().try_for_each(|val| {
+                let len = max_len - val.len();
+                write!(f, "{val}{:len$}", "")
+            })?;
+            writeln!(f, " │")
+        })?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod matrix_test {
     use super::*;
-    use crate::{mat, vecf64};
+    use crate::{mat, vecf};
 
     #[test]
-    fn mat_mul() {
-        let mat = mat!((11) =>
-            3, 0, 1, 4, 9, 8, 0, 6, 9, 9, 2,
-            1, 1, 1, 5, 0, 7, 3, 1, 9, 3, 7,
-            5, 5, 0, 8, 0, 8, 5, 7, 0, 0, 2,
-            6, 0, 9, 3, 5, 1, 5, 1, 3, 5, 9,
-            6, 5, 6, 4, 6, 9, 7, 0, 9, 6, 9,
-            8, 8, 7, 1, 7, 7, 4, 8, 1, 3, 9,
-            5, 4, 4, 5, 2, 1, 6, 0, 6, 6, 4,
-            6, 0, 4, 3, 9, 3, 5, 3, 3, 9, 4,
-            1, 7, 6, 4, 3, 1, 0, 3, 2, 9, 9,
-            3, 5, 5, 0, 0, 2, 8, 6, 9, 5, 9,
-            0, 5, 9, 3, 0, 8, 1, 3, 1, 8, 2,
+    fn matmul() {
+        let m = mat!(4 =>
+            1, 1, 1, 1,
+            2, 2, 2, 2,
+            3, 3, 3, 3,
+            4, 4, 4, 4,
         );
-        let vec = vecf64!((11, 4) => 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
-        let mul = mat * vec;
+        let v = vecf!(4 => 2, 2, 2, 2);
+        let mul = &m * &v;
+        let exp = vecf!(4 => 8, 16, 24, 32);
+        assert_eq!(mul, exp);
+        println!("{m:?}");
         println!("{mul:?}");
+    }
+
+    #[test]
+    fn transposed() {
+        let i = mat!(4 =>
+            1, -1,  0,  0,
+            0,  1, -1,  0,
+            0,  0,  1,  0,
+            0,  0,  1, -1,
+        );
+        let i_t = i.transpose();
+        let c_it = i.const_transpose();
+        assert_eq!(i_t, c_it);
+        let g = mat!(4 =>
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        );
+        println!("{i:?}");
+        println!("{i_t:?}");
+        println!("{:?}", i_t * g * i);
     }
 }
