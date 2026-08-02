@@ -1,14 +1,14 @@
 #[cfg(target_feature = "neon")]
 use core::arch::aarch64::*;
-use super::heap_matrix::{HeapMatrix, HeapVector};
+
+use crate::matrix::Matrix;
+use crate::vector::VecF;
+use crate::traits::Container;
+use super::heap_matrix::HeapMatrix;
 
 pub struct HeapLU<const ROW: usize, const COL: usize = ROW> {
     pub matrix: HeapMatrix<ROW, COL>,
     perm: Perm<ROW>,
-}
-
-struct Perm<const N: usize> {
-    data: Box<[usize]>,
 }
 
 impl<const ROW: usize, const COL: usize> HeapLU<ROW, COL> {
@@ -35,18 +35,41 @@ impl<const ROW: usize, const COL: usize> HeapLU<ROW, COL> {
 // =============================================================================
 
 impl<const N: usize> HeapLU<N> {
+    #[inline(always)]
     pub fn factorize(&mut self) -> bool {
         self.perm.reset();
         self.factorize_full()
     }
 
+    #[inline(always)]
     pub fn factorize_partial_until(&mut self, stop: usize) -> bool {
         self.perm.reset();
         self.factorize_partial(0, stop)
     }
 
+    #[inline(always)]
     pub fn factorize_partial_from(&mut self, start: usize) -> bool {
         self.factorize_partial(start, N)
+    }
+
+    #[inline]
+    pub fn solve_vec(&self, b: &VecF<N>) -> VecF<N> {
+        let mut x = VecF::ZERO;
+        self.solve_vec_into(b, &mut x);
+        x
+    }
+
+    #[inline]
+    pub fn solve_mat<const LEN2: usize, const COL2: usize, B>(
+        &self,
+        b: &B,
+    ) -> Matrix<LEN2, N, COL2>
+    where
+        B: Container<N, COL2>,
+    {
+        let mut res = Matrix::ZERO;
+        self.solve_mat_into::<COL2, _, _>(b, &mut res);
+        res
     }
 }
 
@@ -56,7 +79,7 @@ impl<const N: usize> HeapLU<N> {
 
 #[cfg(target_feature = "neon")]
 impl<const N: usize> HeapLU<N> {
-    #[inline]
+    #[inline(always)]
     fn factorize_partial(&mut self, start: usize, stop: usize) -> bool {
         for i in start..stop {
             let i_offset = i * N;
@@ -76,8 +99,10 @@ impl<const N: usize> HeapLU<N> {
 
             if max_row != i {
                 let row_max_start = max_row * N;
-                let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
-                let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
+                let row_i = self.matrix.ptr_mut(i_offset);
+                let row_m = self.matrix.ptr_mut(row_max_start);
+                // let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
+                // let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
                 unsafe { core::ptr::swap_nonoverlapping(row_i, row_m, N) }
                 self.perm.swap(max_row, i);
             }
@@ -133,7 +158,7 @@ impl<const N: usize> HeapLU<N> {
         true
     }
 
-    #[inline]
+    #[inline(always)]
     fn factorize_full(&mut self) -> bool {
         for i in 0..N {
             let i_offset = i * N;
@@ -153,8 +178,8 @@ impl<const N: usize> HeapLU<N> {
 
             if max_row != i {
                 let row_max_start = max_row * N;
-                let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
-                let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
+                let row_i = self.matrix.ptr_mut(i_offset);
+                let row_m = self.matrix.ptr_mut(row_max_start);
                 unsafe { core::ptr::swap_nonoverlapping(row_i, row_m, N) }
                 self.perm.swap(max_row, i);
             }
@@ -166,24 +191,23 @@ impl<const N: usize> HeapLU<N> {
             let len = N - i1;
 
             for j in i1..N {
-                self[j * N + i] = self[j * N + i] * pivot;
+                self[j * N + i] *= pivot;
             }
 
-            let mat_ptr = self.matrix.data.as_mut_ptr();
             let mut k = 0;
 
             while k + 4 <= len {
-                let u_v = unsafe { vld1q_f64_x2(mat_ptr.add(i1_offset + k)) };
+                let u_v = unsafe { vld1q_f64_x2(self.matrix.ptr(i1_offset + k)) };
                 for j in i1..N {
                     let j_offset = j * N;
                     unsafe {
-                        let factor_v = vdupq_n_f64(-*mat_ptr.add(j_offset + i));
-                        let l_v = vld1q_f64_x2(mat_ptr.add(j_offset + i1 + k));
+                        let factor_v = vdupq_n_f64(*self.matrix.ptr(j_offset + i));
+                        let l_v = vld1q_f64_x2(self.matrix.ptr(j_offset + i1 + k));
                         vst1q_f64_x2(
-                            mat_ptr.add(j_offset + i1 + k),
+                            self.matrix.ptr_mut(j_offset + i1 + k),
                             float64x2x2_t(
-                                vfmaq_f64(l_v.0, factor_v, u_v.0),
-                                vfmaq_f64(l_v.1, factor_v, u_v.1)
+                                vfmsq_f64(l_v.0, factor_v, u_v.0),
+                                vfmsq_f64(l_v.1, factor_v, u_v.1)
                             )
                         );
                     }
@@ -191,16 +215,16 @@ impl<const N: usize> HeapLU<N> {
                 k += 4;
             }
 
-            while k + 2 <= len {
-                let u_v = unsafe { vld1q_f64(mat_ptr.add(i1_offset + k)) };
+            if k + 2 <= len {
+                let u_v = unsafe { vld1q_f64(self.matrix.ptr(i1_offset + k)) };
                 for j in i1..N {
                     let j_offset = j * N;
                     unsafe {
-                        let factor_v = vdupq_n_f64(-*mat_ptr.add(j_offset + i));
-                        let l_v = vld1q_f64(mat_ptr.add(j_offset + i1 + k));
+                        let factor_v = vdupq_n_f64(*self.matrix.ptr(j_offset + i));
+                        let l_v = vld1q_f64(self.matrix.ptr(j_offset + i1 + k));
                         vst1q_f64(
-                            mat_ptr.add(j_offset + i1 + k),
-                            vfmaq_f64(l_v, factor_v, u_v)
+                            self.matrix.ptr_mut(j_offset + i1 + k),
+                            vfmsq_f64(l_v, factor_v, u_v)
                         )
                     }
                 }
@@ -220,8 +244,8 @@ impl<const N: usize> HeapLU<N> {
     }
 
     /// x = A⁻¹b
-    #[inline]
-    pub fn solve_vec(&self, b: &HeapVector<N>, x: &mut HeapVector<N>) {
+    #[inline(always)]
+    pub fn solve_vec_into(&self, b: &VecF<N>, x: &mut VecF<N>) {
         for i in 0..N {
             let offset = i * N;
             let mut acc = b[self.perm[i]];
@@ -233,8 +257,8 @@ impl<const N: usize> HeapLU<N> {
 
             while j + 4 <= i {
                 unsafe {
-                    let lu_v = vld1q_f64_x2(self.matrix.data.as_ptr().add(offset + j));
-                    let x_v = vld1q_f64_x2(x.data.as_ptr().add(j));
+                    let lu_v = vld1q_f64_x2(self.matrix.ptr(offset + j));
+                    let x_v = vld1q_f64_x2(x.ptr(j));
                     acc0 = vfmsq_f64(acc0, lu_v.0, x_v.0);
                     acc1 = vfmsq_f64(acc1, lu_v.1, x_v.1);
                 }
@@ -243,9 +267,9 @@ impl<const N: usize> HeapLU<N> {
 
             let mut acc_v = unsafe { vaddq_f64(acc0, acc1) };
 
-            while j + 2 <= i {
-                let lu_v = unsafe { vld1q_f64(self.matrix.data.as_ptr().add(offset + j)) };
-                let x_v = unsafe { vld1q_f64(x.data.as_ptr().add(j)) };
+            if j + 2 <= i {
+                let lu_v = unsafe { vld1q_f64(self.matrix.ptr(offset + j)) };
+                let x_v = unsafe { vld1q_f64(x.ptr(j)) };
                 unsafe { acc_v = vfmsq_f64(acc_v, lu_v, x_v) }
                 j += 2;
             }
@@ -270,8 +294,8 @@ impl<const N: usize> HeapLU<N> {
 
             while j + 4 <= N {
                 unsafe {
-                    let lu_v = vld1q_f64_x2(self.matrix.data.as_ptr().add(offset + j));
-                    let x_v = vld1q_f64_x2(x.data.as_ptr().add(j));
+                    let lu_v = vld1q_f64_x2(self.matrix.ptr(offset + j));
+                    let x_v = vld1q_f64_x2(x.ptr(j));
                     acc0 = vfmsq_f64(acc0, lu_v.0, x_v.0);
                     acc1 = vfmsq_f64(acc1, lu_v.1, x_v.1);
                 }
@@ -281,8 +305,8 @@ impl<const N: usize> HeapLU<N> {
             let mut acc_v = unsafe { vaddq_f64(acc0, acc1) };
 
             while j + 2 <= N {
-                let lu_v = unsafe { vld1q_f64(self.matrix.data.as_ptr().add(offset + j)) };
-                let x_v = unsafe { vld1q_f64(x.data.as_ptr().add(j)) };
+                let lu_v = unsafe { vld1q_f64(self.matrix.ptr(offset + j)) };
+                let x_v = unsafe { vld1q_f64(x.ptr(j)) };
                 unsafe { acc_v = vfmsq_f64(acc_v, lu_v, x_v) }
                 j += 2;
             }
@@ -297,12 +321,16 @@ impl<const N: usize> HeapLU<N> {
         }
     }
 
-    #[inline]
-    pub fn solve_mat<const COL2: usize>(
+    #[inline(always)]
+    pub fn solve_mat_into<const COL2: usize, B, X>(
         &self,
-        b: &HeapMatrix<N, COL2>,
-        x: &mut HeapMatrix<N, COL2>
-    ) {
+        b: &B,
+        x: &mut X,
+    )
+    where
+        B: Container<N, COL2>,
+        X: Container<N, COL2>,
+    {
         for i in 0..N {
             let i_offset = i * N;
             let x_offset = i * COL2;
@@ -320,21 +348,21 @@ impl<const N: usize> HeapLU<N> {
                 let l_v = unsafe { vdupq_n_f64(-l_ij) };
                 while c + 4 <= COL2 {
                     unsafe {
-                        let xi_v = vld1q_f64_x2(x.data.as_ptr().add(x_offset + c));
-                        let xj_v = vld1q_f64_x2(x.data.as_ptr().add(j_offset + c));
-                        vst1q_f64_x2(x.data.as_mut_ptr().add(x_offset + c), float64x2x2_t(
+                        let xi_v = vld1q_f64_x2(x.ptr(x_offset + c));
+                        let xj_v = vld1q_f64_x2(x.ptr(j_offset + c));
+                        vst1q_f64_x2(x.ptr_mut(x_offset + c), float64x2x2_t(
                             vfmaq_f64(xi_v.0, l_v, xj_v.0),
                             vfmaq_f64(xi_v.1, l_v, xj_v.1),
                         ));
                     }
                     c += 4;
                 }
-                while c + 2 <= COL2 {
+                if c + 2 <= COL2 {
                     unsafe {
-                        let xi_v = vld1q_f64(x.data.as_ptr().add(x_offset + c));
-                        let xj_v = vld1q_f64(x.data.as_ptr().add(j_offset + c));
+                        let xi_v = vld1q_f64(x.ptr(x_offset + c));
+                        let xj_v = vld1q_f64(x.ptr(j_offset + c));
                         let res = vfmaq_f64(xi_v, l_v, xj_v);
-                        vst1q_f64(x.data.as_mut_ptr().add(x_offset + c), res);
+                        vst1q_f64(x.ptr_mut(x_offset + c), res);
                     }
                     c += 2;
                 }
@@ -357,21 +385,21 @@ impl<const N: usize> HeapLU<N> {
 
                 while c + 4 <= COL2 {
                     unsafe {
-                        let xi_v = vld1q_f64_x2(x.data.as_ptr().add(x_offset + c));
-                        let xj_v = vld1q_f64_x2(x.data.as_ptr().add(j_offset + c));
-                        vst1q_f64_x2(x.data.as_mut_ptr().add(x_offset + c), float64x2x2_t(
+                        let xi_v = vld1q_f64_x2(x.ptr(x_offset + c));
+                        let xj_v = vld1q_f64_x2(x.ptr(j_offset + c));
+                        vst1q_f64_x2(x.ptr_mut(x_offset + c), float64x2x2_t(
                             vfmaq_f64(xi_v.0, u_v, xj_v.0),
                             vfmaq_f64(xi_v.1, u_v, xj_v.1),
                         ));
                     }
                     c += 4;
                 }
-                while c + 2 <= COL2 {
+                if c + 2 <= COL2 {
                     unsafe {
-                        let xi_v = vld1q_f64(x.data.as_ptr().add(x_offset + c));
-                        let xj_v = vld1q_f64(x.data.as_ptr().add(j_offset + c));
+                        let xi_v = vld1q_f64(x.ptr(x_offset + c));
+                        let xj_v = vld1q_f64(x.ptr(j_offset + c));
                         let res = vfmaq_f64(xi_v, u_v, xj_v);
-                        vst1q_f64(x.data.as_mut_ptr().add(x_offset + c), res);
+                        vst1q_f64(x.ptr_mut(x_offset + c), res);
                     }
                     c += 2;
                 }
@@ -386,8 +414,8 @@ impl<const N: usize> HeapLU<N> {
 
             while c + 4 <= COL2 {
                 unsafe {
-                    let xi_v = vld1q_f64_x2(x.data.as_ptr().add(x_offset + c));
-                    vst1q_f64_x2(x.data.as_mut_ptr().add(x_offset + c), float64x2x2_t(
+                    let xi_v = vld1q_f64_x2(x.ptr(x_offset + c));
+                    vst1q_f64_x2(x.ptr_mut(x_offset + c), float64x2x2_t(
                         vmulq_f64(xi_v.0, inv_v),
                         vmulq_f64(xi_v.1, inv_v),
                     ));
@@ -396,8 +424,8 @@ impl<const N: usize> HeapLU<N> {
             }
             while c + 2 <= COL2 {
                 unsafe {
-                    let xi_v = vld1q_f64(x.data.as_ptr().add(x_offset + c));
-                    vst1q_f64(x.data.as_mut_ptr().add(x_offset + c), vmulq_f64(xi_v, inv_v));
+                    let xi_v = vld1q_f64(x.ptr(x_offset + c));
+                    vst1q_f64(x.ptr_mut(x_offset + c), vmulq_f64(xi_v, inv_v));
                 }
                 c += 2;
             }
@@ -434,8 +462,10 @@ impl<const N: usize> HeapLU<N> {
 
             if max_row != i {
                 let row_max_start = max_row * N;
-                let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
-                let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
+                let row_i = self.matrix.ptr_mut(i_offset);
+                let row_m = self.matrix.ptr_mut(row_max_start);
+                // let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
+                // let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
                 unsafe { core::ptr::swap_nonoverlapping(row_i, row_m, N) }
                 self.perm.swap(max_row, i);
             }
@@ -474,8 +504,10 @@ impl<const N: usize> HeapLU<N> {
 
             if max_row != i {
                 let row_max_start = max_row * N;
-                let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
-                let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
+                let row_i = self.matrix.ptr_mut(i_offset);
+                let row_m = self.matrix.ptr_mut(row_max_start);
+                // let row_i = self.matrix[i_offset..i_offset + N].as_mut_ptr();
+                // let row_m = self.matrix[row_max_start..row_max_start + N].as_mut_ptr();
                 unsafe { core::ptr::swap_nonoverlapping(row_i, row_m, N) }
                 self.perm.swap(max_row, i);
             }
@@ -495,8 +527,8 @@ impl<const N: usize> HeapLU<N> {
     }
 
     /// x = A⁻¹b
-    #[inline]
-    pub fn solve_vec(&self, b: &HeapVector<N>, x: &mut HeapVector<N>) {
+    #[inline(always)]
+    pub fn solve_vec_into(&self, b: &VecF<N>, x: &mut VecF<N>) {
         for i in 0..N {
             let offset = i * N;
             let mut acc = b[self.perm[i]];
@@ -516,12 +548,16 @@ impl<const N: usize> HeapLU<N> {
         }
     }
 
-    #[inline]
-    pub fn solve_mat<const COL2: usize>(
+    #[inline(always)]
+    pub fn solve_mat_into<const COL2: usize, B, X>(
         &self,
-        b: &HeapMatrix<N, COL2>,
-        x: &mut HeapMatrix<N, COL2>
-    ) {
+        b: &B,
+        x: &mut X,
+    )
+    where
+        B: Container<N, COL2>,
+        X: Container<N, COL2>,
+    {
         for i in 0..N {
             let i_offset = i * N;
             let x_i_off = i * COL2;
@@ -563,8 +599,13 @@ impl<const N: usize> HeapLU<N> {
 }
 
 // =============================================================================
-// Perm impl
+// Perm
 // =============================================================================
+
+#[repr(align(32))]
+struct Perm<const N: usize> {
+    data: Box<[usize]>,
+}
 
 impl<const N: usize> Perm<N> {
     const DATA: [usize; N] = {
@@ -579,10 +620,11 @@ impl<const N: usize> Perm<N> {
 
     fn sequential() -> Self {
         Self {
-            data: Box::new(Self::DATA)
+            data: Box::new(Self::DATA),
         }
     }
 
+    #[inline]
     fn reset(&mut self) {
         self.data.copy_from_slice(&Self::DATA);
     }
@@ -597,6 +639,7 @@ impl<const N: usize> Perm<N> {
         }
     }
 
+    #[inline]
     fn swap(&mut self, a: usize, b: usize) {
         self.data.swap(a, b);
     }
@@ -611,18 +654,14 @@ for HeapLU<ROW, COL> {
     type Output = f64;
 
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe {
-            self.matrix.data.get_unchecked(index)
-        }
+        unsafe { self.matrix.data.get_unchecked(index) }
     }
 }
 
 impl<const ROW: usize, const COL: usize> core::ops::IndexMut<usize>
 for HeapLU<ROW, COL> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe {
-            self.matrix.data.get_unchecked_mut(index)
-        }
+        unsafe { self.matrix.data.get_unchecked_mut(index) }
     }
 }
 
@@ -630,17 +669,13 @@ impl<const N: usize> core::ops::Index<usize> for Perm<N> {
     type Output = usize;
 
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe {
-            self.data.get_unchecked(index)
-        }
+        unsafe { self.data.get_unchecked(index) }
     }
 }
 
 impl<const N: usize> core::ops::IndexMut<usize> for Perm<N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe {
-            self.data.get_unchecked_mut(index)
-        }
+        unsafe { self.data.get_unchecked_mut(index) }
     }
 }
 

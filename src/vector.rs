@@ -1,368 +1,323 @@
-macro_rules! impl_vec {
-    ($name:ident => $ty:ty $(=> $align:literal)?) => {
-        $(#[repr(align($align))])?
-        #[derive(Clone, Copy)]
-        pub struct $name<const N: usize> {
-            pub data: [$ty; N]
-        }
+use crate::traits::Container;
 
-        impl<const N: usize> Default for $name<N> {
-            fn default() -> Self {
-                Self::ZERO
-            }
-        }
-
-        impl<const N: usize> $name<N> {
-            pub const ZERO: Self = Self { data: unsafe { core::mem::zeroed::<[$ty; N]>() } };
-
-            pub const SEQUENTIAL: Self = {
-                let mut data = unsafe { core::mem::zeroed::<[$ty; N]>() };
-                let mut i = 1;
-                while i < N {
-                    data[i] = i as $ty;
-                    i += 1;
-                }
-                Self { data }
-            };
-
-            pub fn sequential() -> Self {
-                Self {
-                    data: core::array::from_fn::<$ty, N, _>(|i| i as $ty)
-                }
-            }
-
-            pub const fn swap(&mut self, a: usize, b: usize) {
-                self.data.swap(a, b)
-            }
-
-            pub fn map<R>(&self, f: impl FnMut($ty) -> R) -> [R; N] {
-                self.data.map(f)
-            }
-
-            pub fn iter(&self) -> Iter<'_, $ty, N> {
-                Iter {
-                    data: self.data.as_ptr(),
-                    count: 0,
-                    marker: core::marker::PhantomData,
-                }
-            }
-
-            pub fn iter_mut(&mut self) -> IterMut<'_, $ty, N> {
-                IterMut {
-                    data: self.data.as_mut_ptr(),
-                    count: 0,
-                    marker: core::marker::PhantomData,
-                }
-            }
-
-            pub fn chunks_exact(&self, size: usize) -> core::slice::ChunksExact<'_, $ty> {
-                self.data.chunks_exact(size)
-            }
-
-            pub fn chunks_exact_mut(&mut self, size: usize) -> core::slice::ChunksExactMut<'_, $ty> {
-                self.data.chunks_exact_mut(size)
-            }
-
-            pub fn scalar_mul(&self, rhs: $ty) -> Self {
-                let mut out = Self::ZERO;
-                out.iter_mut()
-                    .zip(&self.data)
-                    .for_each(|(val, src)| *val = src * rhs);
-                out
-            }
-        }
-
-        impl<const N: usize> PartialEq for $name<N> {
-            fn eq(&self, other: &Self) -> bool {
-                self.iter().zip(other.iter())
-                    .all(|(a, b)| a == b)
-            }
-        }
-
-        // =============================================================================
-        // Arithmetic
-        // =============================================================================
-
-        impl<const N: usize> core::ops::Mul<Self> for $name<N> {
-            type Output = $ty;
-
-            fn mul(self, rhs: Self) -> Self::Output {
-                self.iter().zip(&rhs).map(|(a, b)| a * b).sum()
-            }
-        }
-
-        impl<'a, const N: usize> core::ops::Mul<$name<N>> for &'a $name<N> {
-            type Output = $ty;
-
-            fn mul(self, rhs: $name<N>) -> Self::Output {
-                self.iter().zip(&rhs).map(|(a, b)| a * b).sum()
-            }
-        }
-
-        impl<'a, const N: usize> core::ops::Mul<Self> for &'a $name<N> {
-            type Output = $ty;
-
-            fn mul(self, rhs: Self) -> Self::Output {
-                self.iter().zip(rhs).map(|(a, b)| a * b).sum()
-            }
-        }
-
-        impl<const N: usize> core::ops::Mul<[$ty; N]> for $name<N> {
-            type Output = $ty;
-
-            fn mul(self, rhs: [$ty; N]) -> Self::Output {
-                self.iter().zip(&rhs).map(|(a, b)| a * b).sum()
-            }
-        }
-
-        impl<const N: usize> core::ops::Add<Self> for $name<N> {
-            type Output = Self;
-
-            fn add(mut self, rhs: Self) -> Self::Output {
-                self.iter_mut().zip(&rhs)
-                    .for_each(|(a, b)| *a += b);
-                self
-            }
-        }
-
-        impl<const N: usize> core::ops::AddAssign<Self> for $name<N> {
-            fn add_assign(&mut self, rhs: Self) {
-                self.iter_mut().zip(&rhs)
-                    .for_each(|(a, b)| *a += b);
-            }
-        }
-
-        impl<const N: usize> core::ops::Add<&Self> for $name<N> {
-            type Output = Self;
-
-            fn add(mut self, rhs: &Self) -> Self::Output {
-                self.iter_mut().zip(rhs)
-                    .for_each(|(a, b)| *a += b);
-                self
-            }
-        }
-
-        impl<const N: usize> core::ops::AddAssign<&Self> for $name<N> {
-            fn add_assign(&mut self, rhs: &Self) {
-                self.iter_mut().zip(rhs)
-                    .for_each(|(a, b)| *a += b);
-            }
-        }
-
-        impl<const N: usize> core::ops::Sub<Self> for $name<N> {
-            type Output = Self;
-
-            fn sub(mut self, rhs: Self) -> Self::Output {
-                self.iter_mut().zip(&rhs)
-                    .for_each(|(a, b)| *a -= b);
-                self
-            }
-        }
-
-        impl<const N: usize> core::ops::Sub<$name<N>> for &$name<N> {
-            type Output = $name<N>;
-
-            fn sub(self, rhs: $name<N>) -> Self::Output {
-                let mut result = $name::ZERO;
-                for i in 0..N {
-                    result[i] = self[i] - rhs[i]
-                }
-                result
-            }
-        }
-
-        // =============================================================================
-        // IntoIterator
-        // =============================================================================
-
-        impl<'a, const N: usize> IntoIterator for &'a $name<N> {
-            type Item = &'a $ty;
-            type IntoIter = Iter<'a, $ty, N>;
-
-            fn into_iter(self) -> Self::IntoIter {
-                self.iter()
-            }
-        }
-
-        impl<'a, const N: usize> IntoIterator for &'a mut $name<N> {
-            type Item = &'a mut $ty;
-            type IntoIter = IterMut<'a, $ty, N>;
-
-            fn into_iter(self) -> Self::IntoIter {
-                self.iter_mut()
-            }
-        }
-
-        impl<const N: usize> FromIterator<$ty> for $name<N> {
-            fn from_iter<T: IntoIterator<Item = $ty>>(iter: T) -> Self {
-                let mut this = Self::ZERO;
-                this.iter_mut().zip(iter)
-                    .for_each(|(a, b)| *a = b);
-                this
-            }
-        }
-
-        impl<const N: usize> core::iter::Sum for $name<N> {
-            fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-                iter.fold(Self::ZERO, |acc, v2| acc + v2)
-            }
-        }
-
-        // =============================================================================
-        // Indexing
-        // =============================================================================
-
-        impl<const N: usize> core::ops::Index<usize> for $name<N> {
-            type Output = $ty;
-
-            fn index(&self, index: usize) -> &Self::Output {
-                unsafe { self.data.get_unchecked(index) }
-            }
-        }
-
-        impl<const N: usize> core::ops::IndexMut<usize> for $name<N> {
-            fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-                unsafe { self.data.get_unchecked_mut(index) }
-            }
-        }
-
-        impl<const N: usize> core::ops::Index<core::ops::Range<usize>> for $name<N> {
-            type Output = [$ty];
-
-            fn index(&self, index: core::ops::Range<usize>) -> &Self::Output {
-                unsafe { self.data.get_unchecked(index) }
-            }
-        }
-
-        impl<const N: usize> core::ops::IndexMut<core::ops::Range<usize>> for $name<N> {
-            fn index_mut(&mut self, index: core::ops::Range<usize>) -> &mut Self::Output {
-                unsafe { self.data.get_unchecked_mut(index) }
-            }
-        }
-
-        // =============================================================================
-        // Debug
-        // =============================================================================
-
-        impl<const N: usize> core::fmt::Debug for $name<N> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "[")?;
-                self.data.iter().try_for_each(|v| write!(f, " {:.2e} ", v))?;
-                write!(f, "]")
-            }
-        }
-    };
+#[repr(align(32))]
+#[derive(Clone, Copy)]
+pub struct VecF<const N: usize> {
+    pub data: [f64; N]
 }
 
-impl_vec!(VecF => f64 => 32);
-impl_vec!(VecU => usize => 32);
+impl<const N: usize> Default for VecF<N> {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl<const N: usize> VecF<N> {
+    pub const ZERO: Self = Self { data: [0f64; N] };
+
+    pub const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    pub fn as_slice(&self) -> &[f64] {
+        self.data.as_slice()
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        *self = Self::ZERO
+    }
+
+    #[inline(always)]
+    pub fn ptr(&self, offset: usize) -> *const f64 {
+        unsafe { self.data.as_ptr().add(offset) }
+    }
+
+    #[inline(always)]
+    pub fn ptr_mut(&mut self, offset: usize) -> *mut f64 {
+        unsafe { self.data.as_mut_ptr().add(offset) }
+    }
+
+    #[inline(always)]
+    pub const fn swap(&mut self, a: usize, b: usize) {
+        self.data.swap(a, b)
+    }
+
+    pub fn map<R>(&self, f: impl FnMut(f64) -> R) -> [R; N] {
+        self.data.map(f)
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'_, f64> {
+        self.data.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, f64> {
+        self.data.iter_mut()
+    }
+
+    pub fn chunks_exact(&self, size: usize) -> core::slice::ChunksExact<'_, f64> {
+        self.data.chunks_exact(size)
+    }
+
+    pub fn chunks_exact_mut(&mut self, size: usize) -> core::slice::ChunksExactMut<'_, f64> {
+        self.data.chunks_exact_mut(size)
+    }
+
+    pub fn scalar_mul(&self, rhs: f64) -> Self {
+        let mut out = Self::ZERO;
+        out.iter_mut()
+            .zip(&self.data)
+            .for_each(|(val, src)| *val = src * rhs);
+        out
+    }
+
+    #[inline]
+    /// res = self * scalar - rhs
+    pub fn scalar_mul_sub(&self, scalar: f64, rhs: &Self) -> Self {
+        let mut res = Self::ZERO;
+        self.scalar_mul_sub_into(scalar, rhs, &mut res);
+        res
+    }
+}
 
 // =============================================================================
-// Iter
+// Neon impl
 // =============================================================================
 
-pub struct Iter<'a, T, const N: usize> {
-    data: *const T,
-    count: usize,
-    marker: core::marker::PhantomData<&'a T>,
-}
+#[cfg(target_feature = "neon")]
+use core::arch::aarch64::*;
 
-impl<'a, T, const N: usize> Iterator for Iter<'a, T, N> {
-    type Item = &'a T;
+#[cfg(target_feature = "neon")]
+impl<const N: usize> VecF<N> {
+    #[inline]
+    /// res = self - mat * b
+    pub fn sub_mat_vec_mul_into<const COL: usize, MAT>(
+        &self,
+        mat: &MAT,
+        b: &VecF<COL>,
+        res: &mut Self,
+    )
+    where
+        MAT: Container<N, COL>
+    {
+        for i in 0..N {
+            let offset = i * COL;
+            let mut acc0 = unsafe { vdupq_n_f64(0.0) };
+            let mut acc1 = unsafe { vdupq_n_f64(0.0) };
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count == N { return None }
-        unsafe {
-            let out = self.data.add(self.count);
-            self.count += 1;
-            Some(&*out)
+            let mut j = 0;
+            while j + 4 <= COL {
+                unsafe {
+                    let m_vec = vld1q_f64_x2(mat.ptr(offset + j));
+                    let b_vec = vld1q_f64_x2(b.ptr(j));
+                    acc0 = vfmaq_f64(acc0, m_vec.0, b_vec.0);
+                    acc1 = vfmaq_f64(acc1, m_vec.1, b_vec.1);
+                }
+                j += 4;
+            }
+            let mut acc = unsafe { vaddq_f64(acc0, acc1) };
+            if j + 2 <= COL {
+                unsafe {
+                    let m_vec = vld1q_f64(mat.ptr(offset + j));
+                    let b_vec = vld1q_f64(b.ptr(j));
+                    acc = vfmaq_f64(acc, m_vec, b_vec);
+                }
+                j += 2;
+            }
+            let mut dot = unsafe { vaddvq_f64(acc) };
+            if j < COL {
+                dot += mat[offset + j] * b[j];
+            }
+            res[i] = self[i] - dot;
         }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (N - self.count, Some(N - self.count))
+    #[inline]
+    /// res = self * scalar - rhs
+    pub fn scalar_mul_sub_into(&self, scalar: f64, rhs: &Self, res: &mut Self) {
+
+        let s_v = unsafe { vdupq_n_f64(scalar) };
+        let mut i = 0;
+        while i + 4 <= N {
+            unsafe {
+                let l_v = vld1q_f64_x2(self.ptr(i));
+                let r_v = vld1q_f64_x2(rhs.ptr(i));
+                vst1q_f64_x2(
+                    res.ptr_mut(i),
+                    float64x2x2_t(
+                        vfmaq_f64(vnegq_f64(r_v.0), l_v.0, s_v),
+                        vfmaq_f64(vnegq_f64(r_v.1), l_v.1, s_v),
+                    )
+                );
+            }
+            i += 4
+        }
+        while i + 2 <= N {
+            unsafe {
+                let l_v = vld1q_f64(self.data.as_ptr().add(i));
+                let r_v = vld1q_f64(rhs.data.as_ptr().add(i));
+                vst1q_f64(
+                    res.data.as_mut_ptr().add(i),
+                    vfmaq_f64(vnegq_f64(r_v), l_v, s_v),
+                );
+            }
+            i += 2
+        }
+        if i < N {
+            res[i] = self[i] * scalar - rhs[i]
+        }
+    }
+
+    #[inline]
+    pub fn vec_cross_mul(&self, rhs: &Self, res: &mut Self) {
+        let mut i = 0;
+        while i + 4 <= N {
+            unsafe {
+                let l_vec = vld1q_f64_x2(self.ptr(i));
+                let r_vec = vld1q_f64_x2(rhs.ptr(i));
+                vst1q_f64_x2(
+                    res.ptr_mut(i),
+                    float64x2x2_t(
+                        vmulq_f64(l_vec.0, r_vec.0),
+                        vmulq_f64(l_vec.1, r_vec.1),
+                    )
+                );
+            }
+            i += 4;
+        }
+        if i + 2 <= N {
+            unsafe {
+                let l_vec = vld1q_f64(self.ptr(i));
+                let r_vec = vld1q_f64(rhs.ptr(i));
+                vst1q_f64(res.ptr_mut(i), vmulq_f64(l_vec, r_vec));
+            }
+            i += 2;
+        }
+        if i < N {
+            res[i] = self[i] * rhs[i];
+        }
     }
 }
 
-impl<'a, T, const N: usize> ExactSizeIterator for Iter<'a, T, N> {
-    fn len(&self) -> usize {
-        N - self.count
+#[cfg(not(target_feature = "neon"))]
+impl<const N: usize> VecF<N> {
+    #[inline]
+    /// res = self - mat * b
+    pub fn sub_mat_vec_mul_into<const COL: usize, MAT>(
+        &self,
+        mat: &MAT,
+        b: &VecF<COL>,
+        res: &mut Self,
+    )
+    where
+        MAT: Container<N, COL>
+    {
+        for i in 0..N {
+            let offset = i * COL;
+            let mut acc = 0.0;
+            for j in 0..COL {
+                acc += mat[offset + j] * b[j];
+            }
+            res[i] = self[i] - acc;
+        }
     }
-}
 
-impl<'a, T, const N: usize> DoubleEndedIterator for Iter<'a, T, N> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.count == N { return None }
-        unsafe {
-            let idx = N - self.count;
-            self.count += 1;
-            Some(&*self.data.add(idx))
+    #[inline]
+    /// res = self * scalar - rhs
+    pub fn scalar_mul_sub_into(&self, scalar: f64, rhs: &Self, res: &mut Self) {
+        for i in 0..N {
+            res[i] = self[i] * scalar - rhs[i]
+        }
+    }
+
+    #[inline]
+    pub fn vec_cross_mul(&self, rhs: &Self, res: &mut Self) {
+        for i in 0..N {
+            res[i] = self[i] * rhs[i];
         }
     }
 }
 
 // =============================================================================
-// IterMut
+// PartialEq
 // =============================================================================
 
-pub struct IterMut<'a, T, const N: usize> {
-    data: *mut T,
-    count: usize,
-    marker: core::marker::PhantomData<&'a mut T>,
-}
-
-impl<'a, T, const N: usize> Iterator for IterMut<'a, T, N> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count == N { return None }
-        unsafe {
-            let out = self.data.add(self.count);
-            self.count += 1;
-            Some(&mut *out)
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (N - self.count, Some(N - self.count))
+impl<const N: usize> PartialEq for VecF<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
     }
 }
 
-impl<'a, T, const N: usize> ExactSizeIterator for IterMut<'a, T, N> {
-    fn len(&self) -> usize {
-        N - self.count
-    }
-}
+// =============================================================================
+// Index & IndexMut
+// =============================================================================
 
-impl<'a, T, const N: usize> DoubleEndedIterator for IterMut<'a, T, N> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.count == N { return None }
-        unsafe {
-            let idx = N - self.count;
-            self.count += 1;
-            Some(&mut *self.data.add(idx))
-        }
-    }
-}
-
-pub struct VecBool<const N: usize> {
-    pub data: [bool; N]
-}
-
-impl<const N: usize> core::ops::Index<usize> for VecBool<N> {
-    type Output = bool;
+impl<const N: usize> core::ops::Index<usize> for VecF<N> {
+    type Output = f64;
 
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe {
-            self.data.get_unchecked(index)
-        }
+        unsafe { self.data.get_unchecked(index) }
     }
 }
 
-impl<const N: usize> core::ops::IndexMut<usize> for VecBool<N> {
+impl<const N: usize> core::ops::IndexMut<usize> for VecF<N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe {
-            self.data.get_unchecked_mut(index)
-        }
+        unsafe { self.data.get_unchecked_mut(index) }
+    }
+}
+
+impl<const N: usize> core::ops::Index<core::ops::Range<usize>> for VecF<N> {
+    type Output = [f64];
+
+    fn index(&self, index: core::ops::Range<usize>) -> &Self::Output {
+        unsafe { self.data.get_unchecked(index) }
+    }
+}
+
+impl<const N: usize> core::ops::IndexMut<core::ops::Range<usize>> for VecF<N> {
+    fn index_mut(&mut self, index: core::ops::Range<usize>) -> &mut Self::Output {
+        unsafe { self.data.get_unchecked_mut(index) }
+    }
+}
+
+// =============================================================================
+// IntoIterator
+// =============================================================================
+
+impl<'a, const N: usize> IntoIterator for &'a VecF<N> {
+    type Item = &'a f64;
+    type IntoIter = core::slice::Iter<'a, f64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, const N: usize> IntoIterator for &'a mut VecF<N> {
+    type Item = &'a mut f64;
+    type IntoIter = core::slice::IterMut<'a, f64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<const N: usize> FromIterator<f64> for VecF<N> {
+    fn from_iter<T: IntoIterator<Item = f64>>(iter: T) -> Self {
+        let mut this = Self::ZERO;
+        this.iter_mut().zip(iter).for_each(|(a, b)| *a = b);
+        this
+    }
+}
+
+// =============================================================================
+// Debug
+// =============================================================================
+
+impl<const N: usize> core::fmt::Debug for VecF<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        self.data.iter().try_for_each(|v| write!(f, " {:.2e} ", v))?;
+        write!(f, "]")
     }
 }

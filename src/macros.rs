@@ -68,16 +68,6 @@ macro_rules! diagonal {
 }
 
 #[macro_export]
-macro_rules! create_mat {
-    ($name:ident => $row:ident, $col:ident) => {
-        type $name = Matrix<{ $row * $col }, $row, $col>;
-    };
-    ($name:ident => $row:expr, $col:expr) => {
-        type $name = Matrix<{ $row * $col }, $row, $col>;
-    };
-}
-
-#[macro_export]
 macro_rules! vecf {
     () => {
         VecF { data: [0.0; _] }
@@ -93,44 +83,5 @@ macro_rules! vecf {
     };
     ($arr:expr) => {
         VecF { data: $arr }
-    };
-}
-
-#[macro_export]
-macro_rules! vecu {
-    () => {
-        VecU { data: [0; _] }
-    };
-    (($n:literal)) => {
-        VecU::<$n> { data: [0; $n] }
-    };
-    ($n:literal => $($val:literal),* $(,)?) => {
-        VecU::<$n> { data: [$($val as usize),*] }
-    };
-}
-
-#[macro_export]
-macro_rules! vecb {
-    () => {
-        VecBool { data: [false; _] }
-    };
-    ([$val:literal; $n:literal]) => {
-        VecBool { data: [$val; $n] }
-    };
-    ($n:literal => $($val:literal),* $(,)?) => {
-        VecBool::<$n> { data: [$($val),*] }
-    };
-    ($arr:expr) => {
-        VecBool { data: $arr }
-    };
-}
-
-#[macro_export]
-macro_rules! create_vec {
-    ($name:ident => [f64; $n:literal]) => {
-        type $name = VecF<$n>;
-    };
-    ($name:ident => [usize; $n:literal]) => {
-        type $name = VecU<$n>;
     };
 }

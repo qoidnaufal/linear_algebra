@@ -2,25 +2,54 @@ use core::ops::Range;
 #[cfg(target_feature = "neon")]
 use core::arch::aarch64::*;
 
+use crate::vector::VecF;
+use crate::traits::Container;
+
+#[repr(align(32))]
 pub struct HeapMatrix<const ROW: usize, const COL: usize = ROW> {
-    pub data: Box<[f64]>
+    pub data: Box<[f64]>,
 }
 
-pub type HeapVector<const N: usize> = HeapMatrix<N, 1>;
+impl<const ROW: usize, const COL: usize>
+Container<ROW, COL> for HeapMatrix<ROW, COL> {
+    fn ptr(&self, offset: usize) -> *const f64 {
+        unsafe { self.data.as_ptr().add(offset) }
+    }
+
+    fn ptr_mut(&mut self, offset: usize) -> *mut f64 {
+        unsafe { self.data.as_mut_ptr().add(offset) }
+    }
+}
 
 impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     pub fn zero() -> Self {
         Self {
-            data: vec![0f64; ROW * COL].into_boxed_slice()
+            data: vec![0f64; ROW * COL].into_boxed_slice(),
         }
     }
 
-    pub const fn request_size() -> usize {
+    pub const fn len(&self) -> usize {
+        ROW * COL
+    }
+
+    pub const fn data_size() -> usize {
         ROW * COL * core::mem::size_of::<f64>()
     }
 
     pub const fn as_slice(&self) -> &[f64] {
         &self.data
+    }
+
+    pub const fn as_slice_mut(&mut self) -> &mut [f64] {
+        &mut self.data
+    }
+
+    pub fn ptr(&self, offset: usize) -> *const f64 {
+        unsafe { self.data.as_ptr().add(offset) }
+    }
+
+    pub fn ptr_mut(&mut self, offset: usize) -> *mut f64 {
+        unsafe { self.data.as_mut_ptr().add(offset) }
     }
 
     pub fn row_iter(&self) -> core::slice::ChunksExact<'_, f64> {
@@ -32,9 +61,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     }
 
     pub fn split_at_mut(&mut self, mid: usize) -> (&mut [f64], &mut [f64]) {
-        unsafe {
-            self.data.split_at_mut_unchecked(mid)
-        }
+        unsafe { self.data.split_at_mut_unchecked(mid) }
     }
 
     pub fn transpose_into(&self, res: &mut HeapMatrix<COL, ROW>) {
@@ -61,17 +88,17 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     }
 
     pub fn copy_from_slice(&mut self, src: &[f64]) {
+        debug_assert_eq!(src.len(), ROW * COL);
         self.data.copy_from_slice(src);
     }
 
     pub fn copy_rows(&mut self, src: &Self, start: usize, end: usize) {
         let start = start * COL;
-        let end = end * COL;
         unsafe {
             core::ptr::copy_nonoverlapping(
-                src[start..end].as_ptr(),
-                self[start..end].as_mut_ptr(),
-                end - start,
+                src.ptr(start),
+                self.ptr_mut(start),
+                end * COL - start
             );
         }
     }
@@ -92,8 +119,8 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let src_row = (i + src_row_start) * COL2 + src_col_start;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    src[src_row..src_row + col_count].as_ptr(),
-                    self[dst_row..dst_row + col_count].as_mut_ptr(),
+                    src.ptr(src_row),
+                    self.ptr_mut(dst_row),
                     col_count
                 );
             }
@@ -107,20 +134,18 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
 
 #[cfg(target_feature = "neon")]
 impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
-    pub fn add_rows(
-        &mut self,
-        src: &Self,
-        start: usize,
-        end: usize,
-    ) {
+    pub fn add_rows<SRC>(&mut self, src: &SRC, start: usize, end: usize)
+    where
+        SRC: Container<ROW, COL>
+    {
         for i in start..end {
             let row = i * COL;
             let mut j = 0;
             while j + 4 <= COL {
                 unsafe {
-                    let dst_ptr = self.data.as_mut_ptr().add(row + j);
+                    let dst_ptr = self.ptr_mut(row + j);
                     let dst_vec = vld1q_f64_x2(dst_ptr);
-                    let src_vec = vld1q_f64_x2(src.data.as_ptr().add(row + j));
+                    let src_vec = vld1q_f64_x2(src.ptr(row + j));
                     vst1q_f64_x2(dst_ptr, float64x2x2_t(
                         vaddq_f64(dst_vec.0, src_vec.0),
                         vaddq_f64(dst_vec.1, src_vec.1),
@@ -135,14 +160,17 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn add_block<const ROW2: usize, const COL2: usize>(
+    pub fn add_block<const ROW2: usize, const COL2: usize, SRC>(
         &mut self,
-        src: &HeapMatrix<ROW2, COL2>,
+        src: &SRC,
         dst_row_start: usize,
         dst_col_start: usize,
         src_row_start: usize,
         src_col_start: usize,
-    ) {
+    )
+    where
+        SRC: Container<ROW2, COL2>
+    {
         let col_count = (COL - dst_col_start).min(COL2 - src_col_start);
         let row_count = (ROW - dst_row_start).min(ROW2 - src_row_start);
 
@@ -153,9 +181,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut j = 0;
             while j + 4 <= col_count {
                 unsafe {
-                    let dst_ptr = self.data.as_mut_ptr().add(dst_row + j);
+                    let dst_ptr = self.ptr_mut(dst_row + j);
                     let dst_vec = vld1q_f64_x2(dst_ptr);
-                    let src_vec = vld1q_f64_x2(src.data.as_ptr().add(src_row + j));
+                    let src_vec = vld1q_f64_x2(src.ptr(src_row + j));
                     vst1q_f64_x2(dst_ptr, float64x2x2_t(
                         vaddq_f64(dst_vec.0, src_vec.0),
                         vaddq_f64(dst_vec.1, src_vec.1),
@@ -179,10 +207,10 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut j = 0;
             while j + 4 <= COL {
                 unsafe {
-                    let dst_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + j));
+                    let dst_vec = vld1q_f64_x2(self.ptr(offset + j));
                     let src_vec = vld1q_f64_x2(src.as_ptr().add(offset + j));
                     vst1q_f64_x2(
-                        self.data.as_mut_ptr().add(offset + j),
+                        self.ptr_mut(offset + j),
                         float64x2x2_t(
                             vaddq_f64(dst_vec.0, src_vec.0),
                             vaddq_f64(dst_vec.1, src_vec.1),
@@ -191,14 +219,11 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
                 }
                 j += 4;
             }
-            while j + 2 <= COL {
+            if j + 2 <= COL {
                 unsafe {
-                    let dst_vec = vld1q_f64(self.data.as_ptr().add(offset + j));
+                    let dst_vec = vld1q_f64(self.ptr(offset + j));
                     let src_vec = vld1q_f64(src.as_ptr().add(offset + j));
-                    vst1q_f64(
-                        self.data.as_mut_ptr().add(offset + j),
-                        vaddq_f64(dst_vec, src_vec),
-                    );
+                    vst1q_f64(self.ptr_mut(offset + j), vaddq_f64(dst_vec, src_vec));
                 }
                 j += 2;
             }
@@ -208,172 +233,150 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_mul_into<const COL2: usize>(
-        &self,
-        rhs: &HeapMatrix<COL, COL2>,
-        res: &mut HeapMatrix<ROW, COL2>
-    ) {
+    #[inline]
+    pub fn mat_mul_into<const COL2: usize, RHS, DST>(&self, rhs: &RHS, dst: &mut DST)
+    where
+        RHS: Container<COL, COL2>,
+        DST: Container<ROW, COL2>,
+    {
         for i in 0..ROW {
+            let i_offset = i * COL;
+            let i_offset2 = i * COL2;
             let mut j = 0;
 
             while j + 4 <= COL2 {
                 let mut acc0 = unsafe { vdupq_n_f64(0.0) };
                 let mut acc1 = unsafe { vdupq_n_f64(0.0) };
-
                 for k in 0..COL {
                     unsafe {
-                        let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(k * COL2 + j));
+                        let a_vec = vdupq_n_f64(self[i_offset + k]);
+                        let rhs_vec = vld1q_f64_x2(rhs.ptr(k * COL2 + j));
                         acc0 = vfmaq_f64(acc0, a_vec, rhs_vec.0);
                         acc1 = vfmaq_f64(acc1, a_vec, rhs_vec.1);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64_x2(
-                        res.data.as_mut_ptr().add(i * COL2 + j),
-                        float64x2x2_t(acc0, acc1),
-                    );
-                }
-
+                unsafe { vst1q_f64_x2(dst.ptr_mut(i_offset2 + j), float64x2x2_t(acc0, acc1)) }
                 j += 4;
             }
 
-            while j + 2 <= COL2 {
+            if j + 2 <= COL2 {
                 let mut acc = unsafe { vdupq_n_f64(0.0) };
-
                 for k in 0..COL {
                     unsafe {
-                        let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let rhs_vec = vld1q_f64(rhs.data.as_ptr().add(k * COL2 + j));
+                        let a_vec = vdupq_n_f64(self[i_offset + k]);
+                        let rhs_vec = vld1q_f64(rhs.ptr(k * COL2 + j));
                         acc = vfmaq_f64(acc, a_vec, rhs_vec);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64(
-                        res.data.as_mut_ptr().add(i * COL2 + j),
-                        acc
-                    );
-                }
-
+                unsafe { vst1q_f64(dst.ptr_mut(i_offset2 + j), acc) }
                 j += 2;
             }
 
             if j < COL2 {
                 let mut sum = 0.0;
                 for k in 0..COL {
-                    sum += self[i * COL + k] * rhs[k * COL2 + j];
+                    sum += self[i_offset + k] * rhs[k * COL2 + j];
                 }
-                res[i * COL2 + j] = sum;
+                dst[i_offset2 + j] = sum;
             }
         }
     }
 
-    /// res = self * rhs + c
-    pub fn mat_mul_add_into<const COL2: usize>(
-        &self,
-        rhs: &HeapMatrix<COL, COL2>,
-        c: &HeapMatrix<ROW, COL2>,
-        res: &mut HeapMatrix<ROW, COL2>
-    ) {
+    #[inline]
+    /// dst = self * b + c
+    pub fn mat_mul_add_into<const COL2: usize, RHS, DST>(&self, b: &RHS, c: &DST, dst: &mut DST)
+    where
+        RHS: Container<COL, COL2>,
+        DST: Container<ROW, COL2>,
+    {
         for i in 0..ROW {
             let i_col2 = i * COL2;
+            let i_col = i * COL;
             let mut j = 0;
 
             while j + 4 <= COL2 {
-                let mut acc = unsafe { vld1q_f64_x2(c.data.as_ptr().add(i_col2 + j)) };
-
+                let mut acc = unsafe { vld1q_f64_x2(c.ptr(i_col2 + j)) };
                 for k in 0..COL {
                     unsafe {
-                        let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let b_vec = vld1q_f64_x2(rhs.data.as_ptr().add(k * COL2 + j));
+                        let a_vec = vdupq_n_f64(self[i_col + k]);
+                        let b_vec = vld1q_f64_x2(b.ptr(k * COL2 + j));
                         acc.0 = vfmaq_f64(acc.0, a_vec, b_vec.0);
                         acc.1 = vfmaq_f64(acc.1, a_vec, b_vec.1);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(i_col2 + j), acc);
-                }
-
+                unsafe { vst1q_f64_x2(dst.ptr_mut(i_col2 + j), acc) }
                 j += 4;
             }
 
             while j + 2 <= COL2 {
-                let mut acc = unsafe { vld1q_f64(c.data.as_ptr().add(i_col2 + j)) };
-
+                let mut acc = unsafe { vld1q_f64(c.ptr(i_col2 + j)) };
                 for k in 0..COL {
                     unsafe {
-                        let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let b_vec = vld1q_f64(rhs.data.as_ptr().add(k * COL2 + j));
+                        let a_vec = vdupq_n_f64(self[i_col + k]);
+                        let b_vec = vld1q_f64(b.ptr(k * COL2 + j));
                         acc = vfmaq_f64(acc, a_vec, b_vec);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64(res.data.as_mut_ptr().add(i_col2 + j), acc);
-                }
-
+                unsafe { vst1q_f64(dst.ptr_mut(i_col2 + j), acc) }
                 j += 2;
             }
 
             if j < COL2 {
-                let mut sum = c[i * COL2 + j];
+                let mut sum = c[i_col2 + j];
                 for k in 0..COL {
-                    sum += self[i * COL + k] * rhs[k * COL2 + j];
+                    sum += self[i_col + k] * b[k * COL2 + j];
                 }
-                res[i * COL2 + j] = sum;
+                dst[i * COL2 + j] = sum;
             }
         }
     }
 
-    /// res = self * rhs - c
-    pub fn mat_mul_sub_into<const COL2: usize>(
-        &self,
-        rhs: &HeapMatrix<COL, COL2>,
-        c: &HeapMatrix<ROW, COL2>,
-        res: &mut HeapMatrix<ROW, COL2>
-    ) {
+    #[inline]
+    /// dst = self * rhs - c
+    pub fn mat_mul_sub_into<const COL2: usize, RHS, DST>(&self, rhs: &RHS, c: &DST, dst: &mut DST)
+    where
+        RHS: Container<COL, COL2>,
+        DST: Container<ROW, COL2>,
+    {
         for i in 0..ROW {
             let i_col2 = i * COL2;
             let mut j = 0;
 
             while j + 4 <= COL2 {
-                let mut acc = unsafe { vld1q_f64_x2(c.data.as_ptr().add(i_col2 + j)) };
+                let mut acc = unsafe { vld1q_f64_x2(c.ptr(i_col2 + j)) };
                 acc.0 = unsafe { vnegq_f64(acc.0) };
                 acc.1 = unsafe { vnegq_f64(acc.1) };
 
                 for k in 0..COL {
                     unsafe {
                         let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let b_vec = vld1q_f64_x2(rhs.data.as_ptr().add(k * COL2 + j));
+                        let b_vec = vld1q_f64_x2(rhs.ptr(k * COL2 + j));
                         acc.0 = vfmaq_f64(acc.0, a_vec, b_vec.0);
                         acc.1 = vfmaq_f64(acc.1, a_vec, b_vec.1);
                     }
                 }
 
                 unsafe {
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(i_col2 + j), acc);
+                    vst1q_f64_x2(dst.ptr_mut(i_col2 + j), acc);
                 }
 
                 j += 4;
             }
 
             while j + 2 <= COL2 {
-                let mut acc = unsafe { vld1q_f64(c.data.as_ptr().add(i_col2 + j)) };
+                let mut acc = unsafe { vld1q_f64(c.ptr(i_col2 + j)) };
                 acc = unsafe { vnegq_f64(acc) };
 
                 for k in 0..COL {
                     unsafe {
                         let a_vec = vdupq_n_f64(self[i * COL + k]);
-                        let b_vec = vld1q_f64(rhs.data.as_ptr().add(k * COL2 + j));
+                        let b_vec = vld1q_f64(rhs.ptr(k * COL2 + j));
                         acc = vfmaq_f64(acc, a_vec, b_vec);
                     }
                 }
 
                 unsafe {
-                    vst1q_f64(res.data.as_mut_ptr().add(i_col2 + j), acc);
+                    vst1q_f64(dst.ptr_mut(i_col2 + j), acc);
                 }
 
                 j += 2;
@@ -384,81 +387,129 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
                 for k in 0..COL {
                     sum += self[i * COL + k] * rhs[k * COL2 + j];
                 }
-                res[i * COL2 + j] = sum - c[i * COL2 + j];
+                dst[i * COL2 + j] = sum - c[i * COL2 + j];
                 j += 1;
             }
         }
     }
 
-    /// res = c - self * rhs
-    pub fn sub_mat_mul_into<const COL2: usize>(
-        &self,
-        rhs: &HeapMatrix<COL, COL2>,
-        c: &HeapMatrix<ROW, COL2>,
-        res: &mut HeapMatrix<ROW, COL2>
-    ) {
+    #[inline]
+    /// res = self - b * c
+    pub fn sub_mat_mul_into<const COL2: usize, B, C, DST>(&self, b: &B, c: &C, res: &mut DST)
+    where
+        B: Container<ROW, COL2>,
+        C: Container<COL2, COL>,
+        DST: Container<ROW, COL>,
+    {
         for i in 0..ROW {
+            let i_col = i * COL;
             let i_col2 = i * COL2;
             let mut j = 0;
 
-            while j + 4 <= COL2 {
-                let mut acc = unsafe { vld1q_f64_x2(c.data.as_ptr().add(i_col2 + j)) };
-
-                for k in 0..COL {
+            while j + 4 <= COL {
+                let mut acc = unsafe { vld1q_f64_x2(self.ptr(i_col + j)) };
+                for k in 0..COL2 {
                     unsafe {
-                        let a_vec = vdupq_n_f64(-self[i * COL + k]);
-                        let b_vec = vld1q_f64_x2(rhs.data.as_ptr().add(k * COL2 + j));
-                        acc.0 = vfmaq_f64(acc.0, a_vec, b_vec.0);
-                        acc.1 = vfmaq_f64(acc.1, a_vec, b_vec.1);
+                        let b_vec = vdupq_n_f64(b[i_col2 + k]);
+                        let c_vec = vld1q_f64_x2(c.ptr(k * COL + j));
+                        acc.0 = vfmsq_f64(acc.0, b_vec, c_vec.0);
+                        acc.1 = vfmsq_f64(acc.1, b_vec, c_vec.1);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(i_col2 + j), acc);
-                }
-
+                unsafe { vst1q_f64_x2(res.ptr_mut(i_col + j), acc) }
                 j += 4;
             }
 
-            while j + 2 <= COL2 {
-                let mut acc = unsafe { vld1q_f64(c.data.as_ptr().add(i_col2 + j)) };
-
-                for k in 0..COL {
+            if j + 2 <= COL {
+                let mut acc = unsafe { vld1q_f64(self.ptr(i_col + j)) };
+                for k in 0..COL2 {
                     unsafe {
-                        let a_vec = vdupq_n_f64(-self[i * COL + k]);
-                        let b_vec = vld1q_f64(rhs.data.as_ptr().add(k * COL2 + j));
-                        acc = vfmaq_f64(acc, a_vec, b_vec);
+                        let b_vec = vdupq_n_f64(b[i_col2 + k]);
+                        let c_vec = vld1q_f64(c.ptr(k * COL + j));
+                        acc = vfmsq_f64(acc, b_vec, c_vec);
                     }
                 }
-
-                unsafe {
-                    vst1q_f64(res.data.as_mut_ptr().add(i_col2 + j), acc);
-                }
-
+                unsafe { vst1q_f64(res.ptr_mut(i_col + j), acc) }
                 j += 2;
             }
 
-            while j < COL2 {
-                let mut sum = c[i * COL2 + j];
-                for k in 0..COL {
-                    sum -= self[i * COL + k] * rhs[k * COL2 + j];
+            if j < COL {
+                let mut sum = self[i_col + j];
+                for k in 0..COL2 {
+                    sum -= b[i_col2 + k] * c[k * COL + j];
                 }
-                res[i * COL2 + j] = sum;
-                j += 1;
+                res[i_col + j] = sum;
             }
         }
     }
 
-    pub fn mat_add_into(&self, rhs: &Self, res: &mut Self) {
+    #[inline]
+    /// res = I - self * b
+    pub fn identity_sub_mat_mul_into<RHS, DST>(&self, rhs: &RHS, dst: &mut DST)
+    where
+        RHS: Container<COL, ROW>,
+        DST: Container<ROW, ROW>,
+    {
+        for i in 0..ROW {
+            let i_offset = i * COL;
+            let row_offset = i * ROW;
+            let mut j = 0;
+            let mut identity_row = [0f64; ROW];
+            identity_row[i] = 1.0;
+            let identity = identity_row.as_ptr();
+
+            while j + 4 <= ROW {
+                let mut acc = unsafe { vld1q_f64_x2(identity.add(j)) };
+                for k in 0..COL {
+                    unsafe {
+                        let a_vec = vdupq_n_f64(self[i_offset + k]);
+                        let b_vec = vld1q_f64_x2(rhs.ptr(k * ROW + j));
+                        acc.0 = vfmsq_f64(acc.0, a_vec, b_vec.0);
+                        acc.1 = vfmsq_f64(acc.1, a_vec, b_vec.1);
+                    }
+                }
+                unsafe { vst1q_f64_x2(dst.ptr_mut(row_offset + j), acc) }
+                j += 4;
+            }
+
+            if j + 2 <= ROW {
+                let mut acc = unsafe { vld1q_f64(identity.add(j)) };
+                for k in 0..COL {
+                    unsafe {
+                        let a_vec = vdupq_n_f64(self[i_offset + k]);
+                        let b_vec = vld1q_f64(rhs.ptr(k * ROW + j));
+                        acc = vfmsq_f64(acc, a_vec, b_vec);
+                    }
+                }
+                unsafe { vst1q_f64(dst.ptr_mut(row_offset + j), acc) }
+                j += 2;
+            }
+
+            if j < ROW {
+                let mut sum = unsafe { *identity.add(j) };
+                for k in 0..COL {
+                    sum -= self[i_offset + k] * rhs[k * ROW + j];
+                }
+                dst[row_offset + j] = sum;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn mat_add_into<RHS, DST>(&self, rhs: &RHS, res: &mut DST)
+    where
+        RHS: Container<ROW, COL>,
+        DST: Container<ROW, COL>
+    {
         for row in 0..ROW {
             let offset = row * COL;
 
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64_x2(rhs.ptr(offset + col));
+                    vst1q_f64_x2(res.ptr_mut(offset + col), float64x2x2_t(
                         vaddq_f64(lhs_vec.0, rhs_vec.0),
                         vaddq_f64(lhs_vec.1, rhs_vec.1),
                     ));
@@ -467,12 +518,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             }
             while col + 2 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64(
-                        res.data.as_mut_ptr().add(offset + col),
-                        vaddq_f64(lhs_vec, rhs_vec),
-                    );
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64(rhs.ptr(offset + col));
+                    vst1q_f64(res.ptr_mut(offset + col), vaddq_f64(lhs_vec, rhs_vec));
                 }
                 col += 2;
             }
@@ -482,25 +530,31 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_add_assign(&mut self, rhs: &Self) {
+    pub fn mat_add_assign<SRC: Container<ROW, COL>>(&mut self, rhs: &SRC) {
         for row in 0..ROW {
             let offset = row * COL;
-
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(self.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64_x2(rhs.ptr(offset + col));
+                    vst1q_f64_x2(self.ptr_mut(offset + col), float64x2x2_t(
                         vaddq_f64(lhs_vec.0, rhs_vec.0),
                         vaddq_f64(lhs_vec.1, rhs_vec.1),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64(rhs.ptr(offset + col));
+                    vst1q_f64(self.ptr_mut(offset + col), vaddq_f64(lhs_vec, rhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 self[offset + col] += rhs[offset + col];
-                col += 1;
             }
         }
     }
@@ -511,47 +565,50 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64_x2(rhs.ptr(offset + col));
+                    vst1q_f64_x2(res.ptr_mut(offset + col), float64x2x2_t(
                         vsubq_f64(lhs_vec.0, rhs_vec.0),
                         vsubq_f64(lhs_vec.1, rhs_vec.1),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64(rhs.ptr(offset + col));
+                    vst1q_f64(res.ptr_mut(offset + col), vsubq_f64(lhs_vec, rhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 res[offset + col] = self[offset + col] - rhs[offset + col];
-                col += 1;
             }
         }
     }
 
     // self = self - rhs
-    pub fn mat_sub_assign(&mut self, rhs: &Self) {
+    pub fn mat_sub_assign<RHS: Container<ROW, COL>>(&mut self, rhs: &RHS) {
         for row in 0..ROW {
             let offset = row * COL;
-
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(self.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64_x2(rhs.ptr(offset + col));
+                    vst1q_f64_x2(self.ptr_mut(offset + col), float64x2x2_t(
                         vsubq_f64(lhs_vec.0, rhs_vec.0),
                         vsubq_f64(lhs_vec.1, rhs_vec.1),
                     ));
                 }
                 col += 4;
             }
-            while col + 2 <= COL {
+            if col + 2 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64(
-                        self.data.as_mut_ptr().add(offset + col),
-                        vsubq_f64(lhs_vec, rhs_vec),
-                    );
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64(rhs.ptr(offset + col));
+                    vst1q_f64(self.ptr_mut(offset + col), vsubq_f64(lhs_vec, rhs_vec));
                 }
                 col += 2;
             }
@@ -569,18 +626,25 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    let rhs_vec = vld1q_f64_x2(rhs.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(self.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64_x2(rhs.ptr(offset + col));
+                    vst1q_f64_x2(self.ptr_mut(offset + col), float64x2x2_t(
                         vsubq_f64(rhs_vec.0, lhs_vec.0),
                         vsubq_f64(rhs_vec.1, lhs_vec.1),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    let rhs_vec = vld1q_f64(rhs.ptr(offset + col));
+                    vst1q_f64(self.ptr_mut(offset + col), vsubq_f64(rhs_vec, lhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 self[offset + col] = rhs[offset + col] - self[offset + col];
-                col += 1;
             }
         }
     }
@@ -592,17 +656,23 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    vst1q_f64_x2(res.ptr_mut(offset + col), float64x2x2_t(
                         vmulq_f64(lhs_vec.0, rhs_vec),
                         vmulq_f64(lhs_vec.1, rhs_vec),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    vst1q_f64(res.ptr_mut(offset + col), vmulq_f64(lhs_vec, rhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 res[offset + col] = self[offset + col] * scalar;
-                col += 1;
             }
         }
     }
@@ -614,17 +684,23 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    vst1q_f64_x2(res.ptr_mut(offset + col), float64x2x2_t(
                         vaddq_f64(lhs_vec.0, rhs_vec),
                         vaddq_f64(lhs_vec.1, rhs_vec),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    vst1q_f64(res.ptr_mut(offset + col), vaddq_f64(lhs_vec, rhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 res[offset + col] = self[offset + col] + scalar;
-                col += 1;
             }
         }
     }
@@ -636,17 +712,23 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             let mut col = 0;
             while col + 4 <= COL {
                 unsafe {
-                    let lhs_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + col));
-                    vst1q_f64_x2(res.data.as_mut_ptr().add(offset + col), float64x2x2_t(
+                    let lhs_vec = vld1q_f64_x2(self.ptr(offset + col));
+                    vst1q_f64_x2(res.ptr_mut(offset + col), float64x2x2_t(
                         vsubq_f64(lhs_vec.0, rhs_vec),
                         vsubq_f64(lhs_vec.1, rhs_vec),
                     ));
                 }
                 col += 4;
             }
-            while col < COL {
+            if col + 2 <= COL {
+                unsafe {
+                    let lhs_vec = vld1q_f64(self.ptr(offset + col));
+                    vst1q_f64(res.ptr_mut(offset + col), vsubq_f64(lhs_vec, rhs_vec));
+                }
+                col += 2;
+            }
+            if col < COL {
                 res[offset + col] = self[offset + col] - scalar;
-                col += 1;
             }
         }
     }
@@ -738,22 +820,22 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    /// res = c - self * rhs
+    /// res = self - b * c
     pub fn sub_mat_mul_into<const COL2: usize>(
         &self,
-        rhs: &HeapMatrix<COL, COL2>,
-        c: &HeapMatrix<ROW, COL2>,
-        res: &mut HeapMatrix<ROW, COL2>
+        b: &HeapMatrix<ROW, COL2>,
+        c: &HeapMatrix<COL2, COL>,
+        res: &mut Self
     ) {
         for i in 0..ROW {
-            let res_offset = i * COL2;
-            res.data[res_offset..res_offset + COL2]
-                .copy_from_slice(&c.data[res_offset..res_offset + COL2]);
+            let res_offset = i * COL;
+            res.data[res_offset..res_offset + COL]
+                .copy_from_slice(&self.data[res_offset..res_offset + COL]);
 
-            for k in 0..COL {
-                let a_val = self[i * COL + k];
-                for j in 0..COL2 {
-                    res[res_offset + j] -= a_val * rhs[k * COL2 + j];
+            for k in 0..COL2 {
+                let b_val = b[i * COL2 + k];
+                for j in 0..COL {
+                    res[res_offset + j] -= b_val * c[k * COL + j];
                 }
             }
         }
@@ -789,7 +871,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_add_assign(&mut self, rhs: &Self) {
+    pub fn mat_add_assign<RHS: Container<ROW, COL>>(&mut self, rhs: &RHS) {
         for row in 0..ROW {
             let offset = row * COL;
             for col in 0..COL {
@@ -807,7 +889,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_sub_assign(&mut self, rhs: &Self) {
+    pub fn mat_sub_assign<RHS: Container<ROW, COL>>(&mut self, rhs: &RHS) {
         for row in 0..ROW {
             let offset = row * COL;
             for col in 0..COL {
@@ -873,7 +955,7 @@ impl<const N: usize> HeapMatrix<N> {
 
 #[cfg(target_feature = "neon")]
 impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
-    pub fn mat_vec_mul_into(&self, rhs: &HeapVector<COL>, res: &mut HeapVector<ROW>) {
+    pub fn mat_vec_mul_into(&self, rhs: &VecF<COL>, res: &mut VecF<ROW>) {
         for i in 0..ROW {
             let offset = i * COL;
             let mut acc0 = unsafe { vdupq_n_f64(0.0) };
@@ -883,8 +965,8 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
 
             while j + 4 <= COL {
                 unsafe {
-                    let m_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + j));
-                    let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(j));
+                    let m_vec = vld1q_f64_x2(self.ptr(offset + j));
+                    let r_vec = vld1q_f64_x2(rhs.ptr(j));
                     acc0 = vfmaq_f64(acc0, m_vec.0, r_vec.0);
                     acc1 = vfmaq_f64(acc1, m_vec.1, r_vec.1);
                 }
@@ -895,8 +977,8 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
 
             while j + 2 <= COL {
                 unsafe {
-                    let m_vec = vld1q_f64(self.data.as_ptr().add(offset + j));
-                    let r_vec = vld1q_f64(rhs.data.as_ptr().add(j));
+                    let m_vec = vld1q_f64(self.ptr(offset + j));
+                    let r_vec = vld1q_f64(rhs.ptr(j));
                     acc = vfmaq_f64(acc, m_vec, r_vec);
                 }
                 j += 2;
@@ -912,7 +994,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_vec_mul_scalar_into(&self, rhs: &HeapVector<COL>, scalar: f64, res: &mut HeapVector<ROW>) {
+    pub fn mat_vec_mul_scalar_into(&self, rhs: &VecF<COL>, scalar: f64, res: &mut VecF<ROW>) {
         for i in 0..ROW {
             let offset = i * COL;
             let mut acc0 = unsafe { vdupq_n_f64(0.0) };
@@ -954,9 +1036,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     /// res = c + self * rhs
     pub fn mat_vec_mul_add_into(
         &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
+        rhs: &VecF<COL>,
+        c: &VecF<ROW>,
+        res: &mut VecF<ROW>
     ) {
         for i in 0..ROW {
             let offset = i * COL;
@@ -988,9 +1070,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     /// res = self * rhs - c
     pub fn mat_vec_mul_sub_into(
         &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
+        rhs: &VecF<COL>,
+        c: &VecF<ROW>,
+        res: &mut VecF<ROW>
     ) {
         for i in 0..ROW {
             let offset = i * COL;
@@ -1029,51 +1111,6 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             res[i] = dot - c[i];
         }
     }
-
-    /// res = c - self * rhs
-    pub fn sub_mat_vec_mul_into(
-        &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
-    ) {
-        for i in 0..ROW {
-            let offset = i * COL;
-            let mut acc0 = unsafe { vdupq_n_f64(0.0) };
-            let mut acc1 = unsafe { vdupq_n_f64(0.0) };
-
-            let mut j = 0;
-
-            while j + 4 <= COL {
-                unsafe {
-                    let m_vec = vld1q_f64_x2(self.data.as_ptr().add(offset + j));
-                    let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(j));
-                    acc0 = vfmaq_f64(acc0, m_vec.0, r_vec.0);
-                    acc1 = vfmaq_f64(acc1, m_vec.1, r_vec.1);
-                }
-                j += 4;
-            }
-
-            let mut acc = unsafe { vaddq_f64(acc0, acc1) };
-
-            while j + 2 <= COL {
-                unsafe {
-                    let m_vec = vld1q_f64(self.data.as_ptr().add(offset + j));
-                    let r_vec = vld1q_f64(rhs.data.as_ptr().add(j));
-                    acc = vfmaq_f64(acc, m_vec, r_vec);
-                }
-                j += 2;
-            }
-
-            let mut dot = unsafe { vaddvq_f64(acc) };
-
-            if j < COL {
-                dot += self[offset + j] * rhs[j];
-            }
-
-            res[i] = c[i] - dot;
-        }
-    }
 }
 
 // =============================================================================
@@ -1082,7 +1119,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
 
 #[cfg(not(target_feature = "neon"))]
 impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
-    pub fn mat_vec_mul_into(&self, rhs: &HeapVector<COL>, res: &mut HeapVector<ROW>) {
+    pub fn mat_vec_mul_into(&self, rhs: &VecF<COL>, res: &mut VecF<ROW>) {
         for i in 0..ROW {
             let offset = i * COL;
             let mut acc = 0.0;
@@ -1093,7 +1130,7 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
         }
     }
 
-    pub fn mat_vec_mul_scalar_into(&self, rhs: &HeapVector<COL>, scalar: f64, res: &mut HeapVector<ROW>) {
+    pub fn mat_vec_mul_scalar_into(&self, rhs: &VecF<COL>, scalar: f64, res: &mut VecF<ROW>) {
         for i in 0..ROW {
             let offset = i * COL;
             let mut acc = 0.0;
@@ -1107,9 +1144,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     /// res = c + self * rhs
     pub fn mat_vec_mul_add_into(
         &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
+        rhs: &VecF<COL>,
+        c: &VecF<ROW>,
+        res: &mut VecF<ROW>
     ) {
         for i in 0..ROW {
             let offset = i * COL;
@@ -1124,9 +1161,9 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
     /// res = self * rhs - c
     pub fn mat_vec_mul_sub_into(
         &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
+        rhs: &VecF<COL>,
+        c: &VecF<ROW>,
+        res: &mut VecF<ROW>
     ) {
         for i in 0..ROW {
             let offset = i * COL;
@@ -1136,167 +1173,6 @@ impl<const ROW: usize, const COL: usize> HeapMatrix<ROW, COL> {
             }
             res[i] = acc - c[i];
         }
-    }
-
-    /// res = c - self * rhs
-    pub fn sub_mat_vec_mul_into(
-        &self,
-        rhs: &HeapVector<COL>,
-        c: &HeapVector<ROW>,
-        res: &mut HeapVector<ROW>
-    ) {
-        for i in 0..ROW {
-            let offset = i * COL;
-            let mut acc = 0.0;
-            for j in 0..COL {
-                acc += self[offset + j] * rhs[j];
-            }
-            res[i] = c[i] - acc;
-        }
-    }
-}
-
-// =============================================================================
-// Vector impl
-// =============================================================================
-
-impl<const N: usize> HeapVector<N> {
-    pub fn sequential() -> Self {
-        let data = (0..N).map(|i| i as f64).collect::<Box<[_]>>();
-        Self {
-            data
-        }
-    }
-
-    pub fn iter(&self) -> core::slice::Iter<'_, f64> {
-        self.data.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, f64> {
-        self.data.iter_mut()
-    }
-
-    pub fn chunks_exact(&self, chunk_size: usize) -> core::slice::ChunksExact<'_, f64> {
-        self.data.chunks_exact(chunk_size)
-    }
-
-    pub fn chunks_exact_mut(&mut self, chunk_size: usize) -> core::slice::ChunksExactMut<'_, f64> {
-        self.data.chunks_exact_mut(chunk_size)
-    }
-}
-
-// =============================================================================
-// Vector Arithmetic Neon
-// =============================================================================
-
-#[cfg(target_feature = "neon")]
-impl<const N: usize> HeapVector<N> {
-    pub fn vec_mul(&self, rhs: &Self) -> f64 {
-        let mut i = 0;
-        let mut acc0 = unsafe { vdupq_n_f64(0.0) };
-        let mut acc1 = unsafe { vdupq_n_f64(0.0) };
-        while i + 4 <= N {
-            unsafe {
-                let l_vec = vld1q_f64_x2(self.data.as_ptr().add(i));
-                let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(i));
-                acc0 = vfmaq_f64(acc0, l_vec.0, r_vec.0);
-                acc1 = vfmaq_f64(acc1, l_vec.1, r_vec.1);
-            }
-            i += 4;
-        }
-        let mut res = unsafe { vaddvq_f64(vaddq_f64(acc0, acc1)) };
-        while i < N {
-            res += self[i] * rhs[i];
-            i += 1;
-        }
-        res
-    }
-
-    pub fn vec_s_mul(&self, rhs: &Self, res: &mut Self) {
-        let mut i = 0;
-        while i + 4 <= N {
-            unsafe {
-                let l_vec = vld1q_f64_x2(self.data.as_ptr().add(i));
-                let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(i));
-                vst1q_f64_x2(
-                    res.data.as_mut_ptr().add(i),
-                    float64x2x2_t(
-                        vmulq_f64(l_vec.0, r_vec.0),
-                        vmulq_f64(l_vec.1, r_vec.1),
-                    )
-                );
-            }
-            i += 4;
-        }
-        while i + 2 <= N {
-            unsafe {
-                let l_vec = vld1q_f64(self.data.as_ptr().add(i));
-                let r_vec = vld1q_f64(rhs.data.as_ptr().add(i));
-                vst1q_f64(
-                    res.data.as_mut_ptr().add(i),
-                    vmulq_f64(l_vec, r_vec)
-                );
-            }
-            i += 2;
-        }
-        if i < N {
-            res[i] = self[i] * rhs[i];
-        }
-    }
-
-    pub fn vec_sub_assign(&mut self, rhs: &Self) {
-        let mut i = 0;
-        while i + 4 <= N {
-            unsafe {
-                let l_vec = vld1q_f64_x2(self.data.as_ptr().add(i));
-                let r_vec = vld1q_f64_x2(rhs.data.as_ptr().add(i));
-                vst1q_f64_x2(self.data.as_mut_ptr().add(i), float64x2x2_t(
-                    vsubq_f64(l_vec.0, r_vec.0),
-                    vsubq_f64(l_vec.1, r_vec.1)
-                ));
-            }
-            i += 4;
-        }
-        while i + 2 <= N {
-            unsafe {
-                let l_vec = vld1q_f64(self.data.as_ptr().add(i));
-                let r_vec = vld1q_f64(rhs.data.as_ptr().add(i));
-                vst1q_f64(
-                    self.data.as_mut_ptr().add(i),
-                    vsubq_f64(l_vec, r_vec),
-                );
-            }
-            i += 2;
-        }
-        if i < N {
-            self[i] -= rhs[i];
-        }
-    }
-}
-
-// =============================================================================
-// Vector Arithmetic Non-Neon
-// =============================================================================
-
-#[cfg(not(target_feature = "neon"))]
-impl<const N: usize> HeapVector<N> {
-    pub fn vec_mul(&self, rhs: &Self) -> f64 {
-        self.data.iter()
-            .zip(&rhs.data)
-            .map(|(l, r)| l * r)
-            .sum()
-    }
-
-    pub fn vec_s_mul(&self, rhs: &Self, res: &mut Self) {
-        for i in 0..N {
-            res[i] = self[i] * rhs[i];
-        }
-    }
-
-    pub fn vec_sub_assign(&mut self, rhs: &Self) {
-        self.data.iter_mut()
-            .zip(&rhs.data)
-            .for_each(|(l, r)| *l -= r);
     }
 }
 
@@ -1308,17 +1184,13 @@ impl<const ROW: usize, const COL: usize> core::ops::Index<usize> for HeapMatrix<
     type Output = f64;
 
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe {
-            self.data.get_unchecked(index)
-        }
+        unsafe { self.data.get_unchecked(index) }
     }
 }
 
 impl<const ROW: usize, const COL: usize> core::ops::IndexMut<usize> for HeapMatrix<ROW, COL> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe {
-            self.data.get_unchecked_mut(index)
-        }
+        unsafe { self.data.get_unchecked_mut(index) }
     }
 }
 
@@ -1326,37 +1198,13 @@ impl<const ROW: usize, const COL: usize> core::ops::Index<Range<usize>> for Heap
     type Output = [f64];
 
     fn index(&self, index: Range<usize>) -> &Self::Output {
-        unsafe {
-            self.data.get_unchecked(index)
-        }
+        unsafe { self.data.get_unchecked(index) }
     }
 }
 
 impl<const ROW: usize, const COL: usize> core::ops::IndexMut<Range<usize>> for HeapMatrix<ROW, COL> {
     fn index_mut(&mut self, index: Range<usize>) -> &mut Self::Output {
-        unsafe {
-            self.data.get_unchecked_mut(index)
-        }
-    }
-}
-
-// =============================================================================
-// M += M
-// =============================================================================
-
-impl<const ROW: usize, const COL: usize> core::ops::AddAssign<&Self> for HeapMatrix<ROW, COL> {
-    fn add_assign(&mut self, rhs: &Self) {
-        self.mat_add_assign(rhs);
-    }
-}
-
-// =============================================================================
-// M -= M
-// =============================================================================
-
-impl<const ROW: usize, const COL: usize> core::ops::SubAssign<&Self> for HeapMatrix<ROW, COL> {
-    fn sub_assign(&mut self, rhs: &Self) {
-        self.mat_sub_assign(rhs);
+        unsafe { self.data.get_unchecked_mut(index) }
     }
 }
 
